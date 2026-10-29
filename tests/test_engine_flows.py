@@ -41,6 +41,7 @@ class FakeBroker:
         self._sequence = 0
         self.reject_on_book = False
         self.cancel_fill: int | None = None
+        self.track_modifications = True
 
     async def place_limit(self, order: ManagedOrder) -> PlaceOutcome:
         self._sequence += 1
@@ -68,10 +69,11 @@ class FakeBroker:
     async def modify_price(self, order_id: str, limit_price: Decimal) -> ManagedOrder:
         self.modify_prices.append(limit_price)
         current = self.orders[order_id]
+        modifications = current.modifications + 1 if self.track_modifications else current.modifications
         self.orders[order_id] = replace(
             current,
             limit_price=limit_price,
-            modifications=current.modifications + 1,
+            modifications=modifications,
         )
         return replace(current, limit_price=Decimal("1"))
 
@@ -336,7 +338,7 @@ def test_flatten_reprice_stops_after_twenty_five_steps() -> None:
         engine, _clock = _engine(
             broker,
             flatten_timeout=1.0,
-            flatten_worst_price=Decimal("90"),
+            flatten_worst_price=Decimal("99.75"),
         )
         await _open_long(engine, broker)
         try:
@@ -347,6 +349,40 @@ def test_flatten_reprice_stops_after_twenty_five_steps() -> None:
             raise AssertionError("the 25th reprice was treated as a fill")
         assert len(broker.modify_prices) == 25
         assert broker.modify_prices[-1] == Decimal("101") - TICK * 25
+
+    asyncio.run(scenario())
+
+
+def test_twenty_five_modifications_are_replaced_with_a_new_tag() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+        broker.track_modifications = False
+        engine, _clock = _engine(broker)
+        placed = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=4_000,
+        )
+        assert placed.order is not None and placed.order.broker_order_id is not None
+        tag = placed.order.tag
+        order_id = placed.order.broker_order_id
+        for step in range(25):
+            result = await engine.modify_price(
+                tag,
+                Decimal("100") + TICK * (step + 1),
+                strategy_id="trend",
+                timestamp_ms=5_000,
+            )
+            assert result.order is not None
+            assert result.order.tag == tag
+        assert engine._modifications[order_id] == 25
+        replaced = await engine.modify_price(tag, Decimal("102"), strategy_id="trend", timestamp_ms=5_000)
+        assert replaced.order is not None
+        assert replaced.order.tag != tag
+        assert engine.orders[tag].status is OrderStatus.CANCELLED
 
     asyncio.run(scenario())
 

@@ -16,7 +16,7 @@ from pathlib import Path
 from scalper.execution.broker import Broker
 from scalper.execution.errors import AmbiguousOrderOutcome
 from scalper.execution.halt import entries_halted, entry_halt_reason, halt_new_entries
-from scalper.execution.states import TERMINAL, ManagedOrder, OrderStatus, note_modification
+from scalper.execution.states import TERMINAL, IllegalTransition, ManagedOrder, OrderStatus
 from scalper.execution.submit import place_live_limit
 from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
 from scalper.kite.tags import make_order_tag
@@ -102,7 +102,7 @@ class ExecutionEngine:
         self.recent_rejects = snapshot.recent_rejects
         self._reject_ids: set[str] = set()
         self._replace_sequence = 1
-        self._flatten_modifications = 0
+        self._modifications: dict[str, int] = {}
 
     async def submit_entry(
         self,
@@ -152,17 +152,20 @@ class ExecutionEngine:
         timestamp_ms: int,
     ) -> SubmitResult:
         current = self.orders[tag]
-        _updated, action = note_modification(current, limit_price)
         order_id = current.broker_order_id
         if order_id is None:
             raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {tag}")
-        if action == "modify":
-            await self.broker.modify_price(order_id, limit_price)
+        if not current.working:
+            raise IllegalTransition(f"cannot modify an order in status {current.status.value}")
+        if self._modifications.get(order_id, 0) >= KITE_MAX_MODIFICATIONS_PER_ORDER:
+            booked = await self.cancel(order_id)
+            if booked.status is not OrderStatus.CANCELLED or booked.remaining < 1:
+                return SubmitResult(booked, RiskDecision(True, "allow", "cancel confirmed on the book"))
+        else:
+            await self._count_modify(order_id, limit_price)
             book = await self.refresh()
             return SubmitResult(self._require_book_order(order_id, book), RiskDecision(True, "allow", "price modified"))
-        booked = await self.cancel(order_id)
-        if booked.status is not OrderStatus.CANCELLED or booked.remaining < 1:
-            return SubmitResult(booked, RiskDecision(True, "allow", "cancel confirmed on the book"))
+        booked = await self._book_order(order_id)
         sequence = self._replace_sequence
         self._replace_sequence += 1
         return await self._submit(
@@ -260,7 +263,6 @@ class ExecutionEngine:
 
     async def _drive_flatten(self, order_id: str) -> None:
         deadline = self._monotonic() + self.flatten_timeout
-        sent = 0
         last_modify_at: float | None = None
         while True:
             book = await self.refresh()
@@ -271,14 +273,37 @@ class ExecutionEngine:
                 raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
             now = self._monotonic()
             spaced = last_modify_at is None or now - last_modify_at >= self.flatten_poll_interval
-            if spaced and sent < KITE_MAX_MODIFICATIONS_PER_ORDER and order.modifications < KITE_MAX_MODIFICATIONS_PER_ORDER:
-                nxt = _worse_price(order.side, order.limit_price, self.tick_size)
-                if _price_allowed(order.side, nxt, self.flatten_worst_price) and nxt != order.limit_price:
-                    await self.broker.modify_price(order_id, nxt)
-                    sent += 1
-                    last_modify_at = self._monotonic()
-                    await self._sleep(self.flatten_poll_interval)
-                    continue
+            nxt = _worse_price(order.side, order.limit_price, self.tick_size)
+            can_reprice = _price_allowed(order.side, nxt, self.flatten_worst_price) and nxt != order.limit_price
+            if spaced and can_reprice and self._modifications.get(order_id, 0) >= KITE_MAX_MODIFICATIONS_PER_ORDER:
+                booked = await self.cancel(order_id)
+                if booked.status is not OrderStatus.CANCELLED or booked.remaining < 1:
+                    if self.position_quantity == 0:
+                        return
+                    raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
+                sequence = self._replace_sequence
+                self._replace_sequence += 1
+                replaced = await self._submit(
+                    intent=Intent.FLATTEN,
+                    side=order.side,
+                    limit_price=nxt,
+                    quantity=booked.remaining,
+                    strategy_id="flatten",
+                    timestamp_ms=0,
+                    planned_loss=Decimal("0"),
+                    sequence=sequence,
+                )
+                if replaced.order is None or replaced.order.broker_order_id is None:
+                    raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
+                order_id = replaced.order.broker_order_id
+                last_modify_at = self._monotonic()
+                await self._sleep(self.flatten_poll_interval)
+                continue
+            if spaced and can_reprice:
+                await self._count_modify(order_id, nxt)
+                last_modify_at = self._monotonic()
+                await self._sleep(self.flatten_poll_interval)
+                continue
             if now >= deadline:
                 raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
             await self._sleep(self.flatten_poll_interval)
@@ -348,6 +373,14 @@ class ExecutionEngine:
         self.orders[tag] = booked
         self._note_reject(booked)
         return SubmitResult(booked, decision)
+
+    async def _count_modify(self, order_id: str, limit_price: Decimal) -> None:
+        await self.broker.modify_price(order_id, limit_price)
+        self._modifications[order_id] = self._modifications.get(order_id, 0) + 1
+
+    async def _book_order(self, order_id: str) -> ManagedOrder:
+        book = await self.refresh()
+        return self._require_book_order(order_id, book)
 
     def _require_book_order(self, order_id: str, book: list[ManagedOrder]) -> ManagedOrder:
         for order in book:
