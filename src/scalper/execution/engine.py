@@ -1,36 +1,30 @@
 """Turns a decision into one tagged limit order and keeps the position flat on shutdown.
 
-The paper broker is the default. A second submit with the same tag does not
-create a second order. After 25 price changes the working order is cancelled
-and a new tag is used. Shutdown is clean only when the position is flat and
-every broker order is one this engine knows.
+Every placement goes through place_live_limit. A PlaceOutcome only means the
+order was submitted. Status and position come from the order book afterward.
 """
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass, replace
 from decimal import Decimal
+from pathlib import Path
 
+from scalper.execution.broker import Broker
+from scalper.execution.errors import AmbiguousOrderOutcome
 from scalper.execution.halt import entries_halted, entry_halt_reason
-from scalper.execution.paper import PaperBroker
-from scalper.execution.states import ManagedOrder, OrderStatus, note_modification
+from scalper.execution.states import TERMINAL, ManagedOrder, OrderStatus, note_modification
+from scalper.execution.submit import place_live_limit
+from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
 from scalper.kite.tags import make_order_tag
+from scalper.monitor.alerts import Monitor
 from scalper.risk.gate import Intent, RiskDecision, RiskSnapshot, assess
 
 
 class UnmanagedPosition(RuntimeError):
     """Shutdown stopped because a position or an unknown order is still open."""
-
-
-@dataclass(frozen=True)
-class BrokerView:
-    tag: str
-    broker_order_id: str
-    status: OrderStatus
-    side: str
-    limit_price: Decimal
-    quantity: int
-    filled_quantity: int
 
 
 @dataclass(frozen=True)
@@ -46,16 +40,43 @@ class ShutdownReport:
 
 
 class ExecutionEngine:
-    def __init__(self, broker: PaperBroker, snapshot: RiskSnapshot, *, lot_size: int) -> None:
+    def __init__(
+        self,
+        broker: Broker,
+        snapshot: RiskSnapshot,
+        *,
+        lot_size: int,
+        kill_file: Path,
+        monitor: Monitor,
+        flatten_timeout: float = 0.0,
+        flatten_poll_interval: float = 0.0,
+        flatten_reprice_step: Decimal = Decimal("0.05"),
+        flatten_worst_price: Decimal | None = None,
+    ) -> None:
+        if lot_size < 1:
+            raise ValueError("lot size must be positive")
+        if flatten_timeout < 0 or flatten_poll_interval < 0:
+            raise ValueError("flatten timing must not be negative")
+        if flatten_reprice_step < 0:
+            raise ValueError("flatten reprice step must not be negative")
         self.broker = broker
         self.snapshot = snapshot
         self.lot_size = lot_size
+        self.kill_file = kill_file
+        self.monitor = monitor
+        self.flatten_timeout = flatten_timeout
+        self.flatten_poll_interval = flatten_poll_interval
+        self.flatten_reprice_step = flatten_reprice_step
+        self.flatten_worst_price = flatten_worst_price
         self.orders: dict[str, ManagedOrder] = {}
         self.position_quantity = 0
         self.unmanaged: list[str] = []
+        self.recent_rejects = snapshot.recent_rejects
+        self._reject_ids: set[str] = set()
         self._replace_sequence = 1
+        self._flatten_modifications = 0
 
-    def submit_entry(
+    async def submit_entry(
         self,
         *,
         side: str,
@@ -65,7 +86,7 @@ class ExecutionEngine:
         strategy_id: str,
         timestamp_ms: int,
     ) -> SubmitResult:
-        return self._submit(
+        return await self._submit(
             intent=Intent.ENTRY,
             side=side,
             limit_price=limit_price,
@@ -75,7 +96,7 @@ class ExecutionEngine:
             planned_loss=abs(limit_price - stop_price) * quantity,
         )
 
-    def submit_exit(
+    async def submit_exit(
         self,
         *,
         side: str,
@@ -84,7 +105,7 @@ class ExecutionEngine:
         strategy_id: str,
         timestamp_ms: int,
     ) -> SubmitResult:
-        return self._submit(
+        return await self._submit(
             intent=Intent.EXIT,
             side=side,
             limit_price=limit_price,
@@ -94,104 +115,131 @@ class ExecutionEngine:
             planned_loss=Decimal("0"),
         )
 
-    def modify_price(self, tag: str, limit_price: Decimal, *, strategy_id: str, timestamp_ms: int) -> SubmitResult:
+    async def modify_price(
+        self,
+        tag: str,
+        limit_price: Decimal,
+        *,
+        strategy_id: str,
+        timestamp_ms: int,
+    ) -> SubmitResult:
         current = self.orders[tag]
-        updated, action = note_modification(current, limit_price)
+        _updated, action = note_modification(current, limit_price)
+        order_id = current.broker_order_id
+        if order_id is None:
+            raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {tag}")
         if action == "modify":
-            stored = self.broker.replace_price(tag, limit_price, updated.modifications)
-            self.orders[tag] = stored
-            return SubmitResult(stored, RiskDecision(True, "allow", "price modified"))
-        cancelled = self.broker.cancel_tag(tag)
-        self.orders[tag] = cancelled
+            await self.broker.modify_price(order_id, limit_price)
+            book = await self.refresh()
+            return SubmitResult(self._require_book_order(order_id, book), RiskDecision(True, "allow", "price modified"))
+        booked = await self.cancel(order_id)
+        if booked.status is not OrderStatus.CANCELLED or booked.remaining < 1:
+            return SubmitResult(booked, RiskDecision(True, "allow", "cancel confirmed on the book"))
         sequence = self._replace_sequence
         self._replace_sequence += 1
-        return self._submit(
+        return await self._submit(
             intent=Intent(current.intent),
             side=current.side,
             limit_price=limit_price,
-            quantity=current.remaining,
+            quantity=booked.remaining,
             strategy_id=strategy_id,
             timestamp_ms=timestamp_ms,
             planned_loss=Decimal("0"),
             sequence=sequence,
         )
 
-    def on_trade(self, price: Decimal, quantity: int) -> None:
-        for order in self.broker.on_trade(price, quantity):
-            previous = self.orders.get(order.tag)
-            already = 0 if previous is None else previous.filled_quantity
-            delta = order.filled_quantity - already
-            self.orders[order.tag] = order
-            if delta > 0:
-                signed = delta if order.side == "buy" else -delta
-                self.position_quantity += signed
+    async def cancel(self, order_id: str) -> ManagedOrder:
+        """Cancel by broker order id, then keep only the status on the book."""
+        await self.broker.cancel(order_id)
+        book = await self.refresh()
+        return self._require_book_order(order_id, book)
 
-    def reconcile(self, broker_orders: list[BrokerView]) -> list[str]:
-        problems: list[str] = []
-        for view in broker_orders:
-            local = self.orders.get(view.tag)
-            if local is None or local.broker_order_id != view.broker_order_id:
-                if view.broker_order_id not in self.unmanaged:
-                    self.unmanaged.append(view.broker_order_id)
-                problems.append(f"unknown order {view.broker_order_id}")
-                continue
-            if local.filled_quantity != view.filled_quantity:
-                problems.append(f"fill mismatch {view.tag}")
-                self.orders[view.tag] = replace(
-                    local,
-                    filled_quantity=view.filled_quantity,
-                    status=view.status,
-                )
-        return problems
+    async def on_trade(self, price: Decimal, quantity: int) -> None:
+        """Apply a paper print when the broker simulates one, then read fills from the book."""
+        apply = getattr(self.broker, "on_trade", None)
+        if apply is not None:
+            apply(price, quantity)
+        await self.refresh()
 
-    def recover(self, broker_orders: list[BrokerView]) -> None:
+    async def refresh(self) -> list[ManagedOrder]:
+        book = await self.broker.get_orders()
+        by_id = {order.broker_order_id: order for order in book if order.broker_order_id}
+        for tag, local in list(self.orders.items()):
+            match = by_id.get(local.broker_order_id or "")
+            if match is not None:
+                self.orders[tag] = match
+        for order in book:
+            self._note_reject(order)
+        self.position_quantity = _net_filled(book)
+        return book
+
+    async def recover(self) -> None:
+        book = await self.broker.get_orders()
         self.orders.clear()
         self.unmanaged.clear()
-        self.position_quantity = 0
-        for view in broker_orders:
-            if not view.tag:
-                self.unmanaged.append(view.broker_order_id)
-                continue
-            self.orders[view.tag] = ManagedOrder(
-                tag=view.tag,
-                side=view.side,
-                limit_price=view.limit_price,
-                quantity=view.quantity,
-                filled_quantity=view.filled_quantity,
-                status=view.status,
-                broker_order_id=view.broker_order_id,
-            )
-            signed = view.filled_quantity if view.side == "buy" else -view.filled_quantity
-            self.position_quantity += signed
+        for order in book:
+            if order.tag and order.broker_order_id:
+                self.orders[order.tag] = order
+            elif order.broker_order_id:
+                self.unmanaged.append(order.broker_order_id)
+        self.position_quantity = _net_filled(book)
+        for order in book:
+            self._note_reject(order)
 
-    def shutdown(self, last_price: Decimal | None) -> ShutdownReport:
-        for tag, order in list(self.orders.items()):
-            if not order.working:
-                continue
-            if tag not in self.broker.orders:
-                if order.broker_order_id not in self.unmanaged:
-                    self.unmanaged.append(order.broker_order_id or tag)
-                continue
-            self.orders[tag] = self.broker.cancel_tag(tag)
-        if self.position_quantity != 0:
-            if last_price is None:
-                raise UnmanagedPosition("open position and no price to flatten")
-            side = "sell" if self.position_quantity > 0 else "buy"
-            result = self.submit_exit(
-                side=side,
-                limit_price=last_price,
-                quantity=abs(self.position_quantity),
-                strategy_id="flatten",
-                timestamp_ms=0,
+    async def shutdown(self, last_price: Decimal | None) -> ShutdownReport:
+        book = await self.refresh()
+        self._raise_for_unknown(book)
+        for order in list(self.orders.values()):
+            if order.working and order.broker_order_id:
+                await self.broker.cancel(order.broker_order_id)
+                book = await self.refresh()
+        self._raise_for_unknown(book)
+        if self.position_quantity == 0:
+            return ShutdownReport(True, 0)
+        if last_price is None:
+            raise UnmanagedPosition(f"remaining {self.position_quantity}; orders none")
+        side = _flatten_side(self.position_quantity)
+        result = await self._submit(
+            intent=Intent.FLATTEN,
+            side=side,
+            limit_price=last_price,
+            quantity=abs(self.position_quantity),
+            strategy_id="flatten",
+            timestamp_ms=0,
+            planned_loss=Decimal("0"),
+        )
+        if result.order is None or result.order.broker_order_id is None:
+            raise UnmanagedPosition(f"remaining {self.position_quantity}; orders none")
+        if result.order.status in TERMINAL and result.order.status is not OrderStatus.FILLED:
+            raise UnmanagedPosition(
+                f"remaining {self.position_quantity}; orders {result.order.broker_order_id}"
             )
-            if result.order is None or not result.decision.allowed:
-                raise UnmanagedPosition("flatten was refused")
-            self.on_trade(last_price, abs(self.position_quantity))
-        if self.position_quantity != 0 or self.unmanaged:
-            raise UnmanagedPosition("shutdown left an unmanaged position")
+        if result.order.status is OrderStatus.FILLED and self.position_quantity == 0:
+            return ShutdownReport(True, 0)
+        await self._drive_flatten(result.order.broker_order_id)
         return ShutdownReport(True, self.position_quantity)
 
-    def _submit(
+    async def _drive_flatten(self, order_id: str) -> None:
+        deadline = time.monotonic() + self.flatten_timeout
+        sent = 0
+        while True:
+            book = await self.refresh()
+            order = self._require_book_order(order_id, book)
+            if order.status is OrderStatus.FILLED and self.position_quantity == 0:
+                return
+            if order.status in TERMINAL:
+                raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
+            if sent < KITE_MAX_MODIFICATIONS_PER_ORDER and order.modifications < KITE_MAX_MODIFICATIONS_PER_ORDER:
+                nxt = _worse_price(order.side, order.limit_price, self.flatten_reprice_step)
+                if _price_allowed(order.side, nxt, self.flatten_worst_price) and nxt != order.limit_price:
+                    await self.broker.modify_price(order_id, nxt)
+                    sent += 1
+                    continue
+            if time.monotonic() >= deadline:
+                raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
+            await asyncio.sleep(self.flatten_poll_interval)
+
+    async def _submit(
         self,
         *,
         intent: Intent,
@@ -220,20 +268,90 @@ class ExecutionEngine:
                 lots_requested=lots,
                 open_lots=open_lots,
                 planned_loss=planned_loss,
+                recent_rejects=self.recent_rejects,
             ),
         )
         if not decision.allowed:
             return SubmitResult(None, decision)
-        placed = self.broker.place(
-            ManagedOrder(
-                tag=tag,
-                side=side,
-                limit_price=limit_price,
-                quantity=quantity,
-                intent=intent.value,
+        try:
+            await place_live_limit(
+                self.broker,
+                ManagedOrder(
+                    tag=tag,
+                    side=side,
+                    limit_price=limit_price,
+                    quantity=quantity,
+                    intent=intent.value,
+                ),
+                kill_file=self.kill_file,
+                monitor=self.monitor,
             )
-        )
-        self.orders[tag] = placed
-        return SubmitResult(placed, decision)
+        except AmbiguousOrderOutcome:
+            raise
+        book = await self.refresh()
+        matches = [order for order in book if order.tag == tag]
+        if len(matches) != 1:
+            raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {tag}")
+        booked = matches[0]
+        self.orders[tag] = booked
+        self._note_reject(booked)
+        return SubmitResult(booked, decision)
+
+    def _require_book_order(self, order_id: str, book: list[ManagedOrder]) -> ManagedOrder:
+        for order in book:
+            if order.broker_order_id == order_id:
+                return order
+        raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
+
+    def _note_reject(self, order: ManagedOrder) -> None:
+        if order.status is not OrderStatus.REJECTED or not order.broker_order_id:
+            return
+        if order.broker_order_id in self._reject_ids:
+            return
+        self._reject_ids.add(order.broker_order_id)
+        self.recent_rejects += 1
+        self.snapshot = replace(self.snapshot, recent_rejects=self.recent_rejects)
+
+    def _raise_for_unknown(self, book: list[ManagedOrder]) -> None:
+        known = {order.broker_order_id for order in self.orders.values() if order.broker_order_id}
+        found: list[str] = []
+        for order in book:
+            if not order.broker_order_id:
+                continue
+            if order.broker_order_id not in known or not order.tag:
+                found.append(order.broker_order_id)
+        ids = list(dict.fromkeys([*self.unmanaged, *found]))
+        if ids:
+            raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {', '.join(ids)}")
 
 
+def _net_filled(book: list[ManagedOrder]) -> int:
+    net = 0
+    for order in book:
+        if order.side == "buy":
+            net += order.filled_quantity
+        elif order.side == "sell":
+            net -= order.filled_quantity
+    return net
+
+
+def _flatten_side(position_quantity: int) -> str:
+    return "sell" if position_quantity > 0 else "buy"
+
+
+def _worse_price(side: str, price: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return price
+    if side == "sell":
+        return price - step
+    return price + step
+
+
+def _price_allowed(side: str, price: Decimal, worst: Decimal | None) -> bool:
+    if worst is None:
+        return False
+    if side == "sell":
+        return price >= worst
+    if side == "buy":
+        return price <= worst
+    return False

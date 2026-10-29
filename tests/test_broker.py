@@ -645,25 +645,32 @@ def test_engage_runs_before_the_alert(tmp_path, monkeypatch) -> None:
 
 def test_a_failed_kill_file_still_blocks_the_next_entry(tmp_path) -> None:
     directory = _readonly_dir(tmp_path)
-    engine = ExecutionEngine(PaperBroker(TICK, LOT), _entry_snapshot(), lot_size=LOT)
-    first = engine.submit_entry(
-        side="buy",
-        limit_price=Decimal("100"),
-        quantity=LOT,
-        stop_price=Decimal("99"),
-        strategy_id="trend",
-        timestamp_ms=1_000,
-    )
-    assert first.order is not None
-    assert engine.snapshot.killed is False
     sink = RecordingSink()
     monitor = Monitor(build_metrics(CollectorRegistry()), sink)
-    try:
+
+    async def scenario() -> None:
+        engine = ExecutionEngine(
+            PaperBroker(TICK, LOT),
+            _entry_snapshot(),
+            lot_size=LOT,
+            kill_file=tmp_path / "engine-kill",
+            monitor=monitor,
+        )
+        first = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=1_000,
+        )
+        assert first.order is not None
+        assert engine.snapshot.killed is False
         with pytest.raises(AmbiguousOrderOutcome):
-            asyncio.run(_place_ambiguous(directory / "KILL", monitor))
+            await _place_ambiguous(directory / "KILL", monitor)
         assert not is_killed(directory / "KILL")
         assert entries_halted()
-        second = engine.submit_entry(
+        second = await engine.submit_entry(
             side="buy",
             limit_price=Decimal("100"),
             quantity=LOT,
@@ -675,6 +682,9 @@ def test_a_failed_kill_file_still_blocks_the_next_entry(tmp_path) -> None:
         assert second.decision.allowed is False
         assert second.decision.action == "halt"
         assert len(engine.broker.orders) == 1
+
+    try:
+        asyncio.run(scenario())
     finally:
         directory.chmod(0o755)
 

@@ -1,7 +1,7 @@
 """In-memory broker. A repeated tag returns the original order and does not open another.
 
-The execution engine calls the synchronous methods. The async methods are the
-Broker protocol. None of them open a socket.
+Cancel, modify, and place_limit are the async Broker protocol. None of them
+open a socket. on_trade is the paper fill path.
 """
 
 from __future__ import annotations
@@ -55,18 +55,16 @@ class PaperBroker:
         self.orders[order.tag] = stored
         return stored
 
-    def cancel_tag(self, tag: str) -> ManagedOrder:
-        from scalper.execution.states import cancel
-
-        stored = cancel(self.orders[tag])
-        self.orders[tag] = stored
-        return stored
-
     async def place_limit(self, order: ManagedOrder) -> PlaceOutcome:
         return PlaceOutcome(self.place(order))
 
     async def cancel(self, order_id: str) -> ManagedOrder:
-        return self.cancel_tag(self._tag_for_order_id(order_id))
+        from scalper.execution.states import cancel
+
+        tag = self._tag_for_order_id(order_id)
+        stored = cancel(self.orders[tag])
+        self.orders[tag] = stored
+        return stored
 
     async def modify_price(self, order_id: str, limit_price: Decimal) -> ManagedOrder:
         tag = self._tag_for_order_id(order_id)
