@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+import scalper.execution.halt as entry_halt
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_CSV = Path(__file__).resolve().parent / "fixtures" / "nfo_sample.csv"
 
@@ -16,6 +18,8 @@ def isolated_process(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in list(os.environ):
         if name.startswith("SCALPER_"):
             monkeypatch.delenv(name, raising=False)
+    entry_halt._halted = False
+    entry_halt._reason = ""
 
 
 @pytest.fixture

@@ -8,6 +8,7 @@ import structlog
 
 from scalper.execution.broker import Broker, PlaceOutcome
 from scalper.execution.errors import AmbiguousOrderOutcome
+from scalper.execution.halt import halt_new_entries
 from scalper.execution.states import ManagedOrder
 from scalper.monitor.alerts import Monitor
 from scalper.risk.killfile import engage
@@ -32,6 +33,7 @@ async def place_live_limit(
         return await broker.place_limit(order)
     except AmbiguousOrderOutcome as exc:
         reason = f"ambiguous place {order.tag}: {exc}"
+        halt_new_entries(reason)
         kill_error: Exception | None = None
         try:
             engage(kill_file, reason)

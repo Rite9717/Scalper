@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import httpx
 import pytest
 from prometheus_client import CollectorRegistry
 
+from scalper.clock import IST
 from scalper.compliance import ComplianceError
 from scalper.execution.broker import Broker
+from scalper.execution.engine import ExecutionEngine
+from scalper.execution.halt import entries_halted
 from scalper.execution.errors import (
     AmbiguousOrderOutcome,
     BrokerError,
@@ -29,10 +33,12 @@ from scalper.execution.kite_broker import (
 )
 from scalper.execution.paper import PaperBroker
 from scalper.execution.states import IllegalTransition, ManagedOrder, OrderStatus
+from scalper.execution.submit import engage
 from scalper.execution.submit import place_live_limit
 from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
 from scalper.monitor.alerts import Monitor, RecordingSink
 from scalper.monitor.metrics import build_metrics
+from scalper.risk.gate import RiskSnapshot
 from scalper.risk.killfile import is_killed, read_reason
 
 TICK = Decimal("0.05")
@@ -494,6 +500,183 @@ def test_ambiguous_place_engages_the_kill_file_and_alerts(tmp_path) -> None:
     assert is_killed(kill_file)
     assert "abc123" in (read_reason(kill_file) or "")
     assert sink.messages == [f"Kill switch on: {read_reason(kill_file)}"]
+
+
+class _CallOrder:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[str] = []
+        self.reasons: list[str] = []
+
+    async def kill_switch(self, engaged: bool, reason: str) -> None:
+        self.calls.append("kill_switch")
+        self.reasons.append(reason)
+        if self.fail:
+            raise RuntimeError("alert down")
+
+
+def _entry_snapshot() -> RiskSnapshot:
+    now = datetime(2026, 10, 27, 10, 0, tzinfo=IST)
+    return RiskSnapshot(
+        now=now,
+        trading_mode="paper",
+        lots_requested=1,
+        open_lots=0,
+        max_lots=1,
+        planned_loss=Decimal("0"),
+        max_loss_per_trade=Decimal("3000"),
+        daily_pnl=Decimal("0"),
+        daily_loss_limit=Decimal("5000"),
+        orders_last_second=0,
+        orders_last_minute=0,
+        max_orders_per_second=3,
+        max_orders_per_minute=150,
+        last_quote_at=now,
+        stale_after=timedelta(seconds=5),
+        available_margin=Decimal("100000"),
+        required_margin=Decimal("20000"),
+        flatten_time=datetime.strptime("15:20", "%H:%M").time(),
+        broker_pnl=None,
+        internal_pnl=None,
+        pnl_tolerance=Decimal("250"),
+        exchange_time=now,
+        clock_drift_limit=timedelta(seconds=2),
+        recent_rejects=0,
+        max_rejects=3,
+        killed=False,
+    )
+
+
+def _readonly_dir(tmp_path) -> object:
+    directory = tmp_path / "readonly"
+    directory.mkdir()
+    directory.chmod(0o555)
+    return directory
+
+
+async def _place_ambiguous(kill_file, monitor) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            raise httpx.ReadTimeout("timed out")
+        assert request.url.path == "/orders"
+        return _ok([])
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://api.kite.trade") as client:
+        broker = KiteBroker(
+            trading_mode="live",
+            api_key="key",
+            access_token="token",
+            static_ip="8.8.8.8",
+            observed_ip="8.8.8.8",
+            client=client,
+            tradingsymbol="NIFTY26OCTFUT",
+            poll_interval=0,
+        )
+        await place_live_limit(broker, _order(), kill_file=kill_file, monitor=monitor)
+
+
+def test_a_read_only_kill_directory_still_alerts(tmp_path) -> None:
+    directory = _readonly_dir(tmp_path)
+    sink = RecordingSink()
+    monitor = Monitor(build_metrics(CollectorRegistry()), sink)
+    kill_file = directory / "KILL"
+    try:
+        with pytest.raises(AmbiguousOrderOutcome) as caught:
+            asyncio.run(_place_ambiguous(kill_file, monitor))
+        assert "kill file was not engaged" in str(caught.value)
+        assert sink.messages
+        assert "kill file was not engaged" in sink.messages[0]
+        assert not is_killed(kill_file)
+    finally:
+        directory.chmod(0o755)
+
+
+def test_an_alert_error_after_a_successful_kill_keeps_the_original_outcome(tmp_path) -> None:
+    switch = _CallOrder(fail=True)
+    kill_file = tmp_path / "KILL"
+    with pytest.raises(AmbiguousOrderOutcome) as caught:
+        asyncio.run(_place_ambiguous(kill_file, switch))
+    assert is_killed(kill_file)
+    assert "did not appear" in str(caught.value)
+    assert "alert down" not in str(caught.value)
+    assert not isinstance(caught.value.__cause__, RuntimeError)
+    assert switch.calls == ["kill_switch"]
+
+
+def test_kill_and_alert_failures_both_raise_ambiguous(tmp_path) -> None:
+    directory = _readonly_dir(tmp_path)
+    switch = _CallOrder(fail=True)
+    try:
+        with pytest.raises(AmbiguousOrderOutcome) as caught:
+            asyncio.run(_place_ambiguous(directory / "KILL", switch))
+        assert "kill file was not engaged" in str(caught.value)
+        assert not isinstance(caught.value, RuntimeError)
+        assert switch.calls == ["kill_switch"]
+    finally:
+        directory.chmod(0o755)
+
+
+def test_engage_runs_before_the_alert(tmp_path, monkeypatch) -> None:
+    sequence: list[str] = []
+
+    def record_engage(path, reason) -> None:
+        sequence.append("engage")
+        assert entries_halted()
+        engage(path, reason)
+
+    monkeypatch.setattr("scalper.execution.submit.engage", record_engage)
+    switch = _CallOrder()
+
+    async def scenario() -> None:
+        real_switch = switch.kill_switch
+
+        async def record_switch(engaged: bool, reason: str) -> None:
+            sequence.append("kill_switch")
+            await real_switch(engaged, reason)
+
+        switch.kill_switch = record_switch  # type: ignore[method-assign]
+        await _place_ambiguous(tmp_path / "KILL", switch)
+
+    with pytest.raises(AmbiguousOrderOutcome):
+        asyncio.run(scenario())
+    assert sequence == ["engage", "kill_switch"]
+
+
+def test_a_failed_kill_file_still_blocks_the_next_entry(tmp_path) -> None:
+    directory = _readonly_dir(tmp_path)
+    engine = ExecutionEngine(PaperBroker(TICK, LOT), _entry_snapshot(), lot_size=LOT)
+    first = engine.submit_entry(
+        side="buy",
+        limit_price=Decimal("100"),
+        quantity=LOT,
+        stop_price=Decimal("99"),
+        strategy_id="trend",
+        timestamp_ms=1_000,
+    )
+    assert first.order is not None
+    assert engine.snapshot.killed is False
+    sink = RecordingSink()
+    monitor = Monitor(build_metrics(CollectorRegistry()), sink)
+    try:
+        with pytest.raises(AmbiguousOrderOutcome):
+            asyncio.run(_place_ambiguous(directory / "KILL", monitor))
+        assert not is_killed(directory / "KILL")
+        assert entries_halted()
+        second = engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=2_000,
+        )
+        assert second.order is None
+        assert second.decision.allowed is False
+        assert second.decision.action == "halt"
+        assert len(engine.broker.orders) == 1
+    finally:
+        directory.chmod(0o755)
 
 
 def test_get_orders_maps_kite_statuses_including_partial_fills() -> None:

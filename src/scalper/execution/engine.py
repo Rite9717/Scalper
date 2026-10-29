@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from decimal import Decimal
 
+from scalper.execution.halt import entries_halted, entry_halt_reason
 from scalper.execution.paper import PaperBroker
 from scalper.execution.states import ManagedOrder, OrderStatus, note_modification
 from scalper.kite.tags import make_order_tag
@@ -208,6 +209,8 @@ class ExecutionEngine:
         existing = self.orders.get(tag)
         if existing is not None:
             return SubmitResult(existing, RiskDecision(True, "allow", "duplicate tag"))
+        if intent is Intent.ENTRY and entries_halted():
+            return SubmitResult(None, RiskDecision(False, "halt", entry_halt_reason()))
         lots = max(1, quantity // self.lot_size)
         open_lots = abs(self.position_quantity) // self.lot_size
         decision = assess(
