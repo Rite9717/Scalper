@@ -100,7 +100,7 @@ class ExecutionEngine:
             stored = self.broker.replace_price(tag, limit_price, updated.modifications)
             self.orders[tag] = stored
             return SubmitResult(stored, RiskDecision(True, "allow", "price modified"))
-        cancelled = self.broker.cancel(tag)
+        cancelled = self.broker.cancel_tag(tag)
         self.orders[tag] = cancelled
         sequence = self._replace_sequence
         self._replace_sequence += 1
@@ -171,7 +171,7 @@ class ExecutionEngine:
                 if order.broker_order_id not in self.unmanaged:
                     self.unmanaged.append(order.broker_order_id or tag)
                 continue
-            self.orders[tag] = self.broker.cancel(tag)
+            self.orders[tag] = self.broker.cancel_tag(tag)
         if self.position_quantity != 0:
             if last_price is None:
                 raise UnmanagedPosition("open position and no price to flatten")

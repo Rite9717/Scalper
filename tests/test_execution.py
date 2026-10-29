@@ -235,8 +235,10 @@ def test_paper_mode_never_posts_a_live_order() -> None:
                 client=client,
                 tradingsymbol="NIFTY26OCTFUT",
             )
-            order_id = await live.place_limit(order)
-            assert order_id == "1"
+            outcome = await live.place_limit(order)
+            assert outcome.order.broker_order_id == "1"
+            assert outcome.order.status is OrderStatus.OPEN
+            assert outcome.recovered is False
 
     asyncio.run(scenario())
     assert len(seen) == 1
