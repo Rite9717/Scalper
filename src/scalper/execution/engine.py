@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
@@ -55,32 +56,44 @@ class ExecutionEngine:
         tradingsymbol: str,
         exchange: str,
         lot_size: int,
+        tick_size: Decimal,
         kill_file: Path,
         monitor: Monitor,
-        flatten_timeout: float = 0.0,
-        flatten_poll_interval: float = 0.0,
-        flatten_reprice_step: Decimal = Decimal("0.05"),
-        flatten_worst_price: Decimal | None = None,
+        flatten_timeout: float,
+        flatten_poll_interval: float,
+        flatten_worst_price: Decimal,
+        clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         if not tradingsymbol or not exchange:
             raise ValueError("tradingsymbol and exchange are required")
         if lot_size < 1:
             raise ValueError("lot size must be positive")
-        if flatten_timeout < 0 or flatten_poll_interval < 0:
-            raise ValueError("flatten timing must not be negative")
-        if flatten_reprice_step < 0:
-            raise ValueError("flatten reprice step must not be negative")
+        if tick_size <= 0:
+            raise ValueError("tick size must be positive")
+        if isinstance(flatten_timeout, bool) or not isinstance(flatten_timeout, (int, float)) or flatten_timeout <= 0:
+            raise ValueError("flatten timeout must be positive")
+        if (
+            isinstance(flatten_poll_interval, bool)
+            or not isinstance(flatten_poll_interval, (int, float))
+            or flatten_poll_interval <= 0
+        ):
+            raise ValueError("flatten poll interval must be positive")
+        if not isinstance(flatten_worst_price, Decimal) or flatten_worst_price <= 0:
+            raise ValueError("flatten worst price must be set")
         self.broker = broker
         self.snapshot = snapshot
         self.tradingsymbol = tradingsymbol
         self.exchange = exchange
         self.lot_size = lot_size
+        self.tick_size = tick_size
         self.kill_file = kill_file
         self.monitor = monitor
-        self.flatten_timeout = flatten_timeout
-        self.flatten_poll_interval = flatten_poll_interval
-        self.flatten_reprice_step = flatten_reprice_step
+        self.flatten_timeout = float(flatten_timeout)
+        self.flatten_poll_interval = float(flatten_poll_interval)
         self.flatten_worst_price = flatten_worst_price
+        self._monotonic = clock or time.monotonic
+        self._sleep = sleep or asyncio.sleep
         self.orders: dict[str, ManagedOrder] = {}
         self.foreign_orders: list[ManagedOrder] = []
         self.position_quantity = 0
@@ -246,8 +259,9 @@ class ExecutionEngine:
         return ShutdownReport(True, self.position_quantity)
 
     async def _drive_flatten(self, order_id: str) -> None:
-        deadline = time.monotonic() + self.flatten_timeout
+        deadline = self._monotonic() + self.flatten_timeout
         sent = 0
+        last_modify_at: float | None = None
         while True:
             book = await self.refresh()
             order = self._require_book_order(order_id, book)
@@ -255,15 +269,19 @@ class ExecutionEngine:
                 return
             if order.status in TERMINAL:
                 raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
-            if sent < KITE_MAX_MODIFICATIONS_PER_ORDER and order.modifications < KITE_MAX_MODIFICATIONS_PER_ORDER:
-                nxt = _worse_price(order.side, order.limit_price, self.flatten_reprice_step)
+            now = self._monotonic()
+            spaced = last_modify_at is None or now - last_modify_at >= self.flatten_poll_interval
+            if spaced and sent < KITE_MAX_MODIFICATIONS_PER_ORDER and order.modifications < KITE_MAX_MODIFICATIONS_PER_ORDER:
+                nxt = _worse_price(order.side, order.limit_price, self.tick_size)
                 if _price_allowed(order.side, nxt, self.flatten_worst_price) and nxt != order.limit_price:
                     await self.broker.modify_price(order_id, nxt)
                     sent += 1
+                    last_modify_at = self._monotonic()
+                    await self._sleep(self.flatten_poll_interval)
                     continue
-            if time.monotonic() >= deadline:
+            if now >= deadline:
                 raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
-            await asyncio.sleep(self.flatten_poll_interval)
+            await self._sleep(self.flatten_poll_interval)
 
     async def _submit(
         self,

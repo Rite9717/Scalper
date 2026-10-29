@@ -658,7 +658,11 @@ def test_a_failed_kill_file_still_blocks_the_next_entry(tmp_path) -> None:
             tradingsymbol="NIFTY26OCTFUT",
             exchange="NFO",
             lot_size=LOT,
+            tick_size=TICK,
             kill_file=tmp_path / "engine-kill",
+            flatten_timeout=5.0,
+            flatten_poll_interval=0.25,
+            flatten_worst_price=Decimal("1"),
             monitor=monitor,
         )
         first = await engine.submit_entry(

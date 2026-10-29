@@ -85,7 +85,11 @@ def _engine(
         tradingsymbol=SYMBOL,
         exchange=EXCHANGE,
         lot_size=LOT,
+        tick_size=TICK,
         kill_file=Path("KILL"),
+        flatten_timeout=5.0,
+        flatten_poll_interval=0.25,
+        flatten_worst_price=Decimal("1"),
         monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
         **kwargs,  # type: ignore[arg-type]
     )

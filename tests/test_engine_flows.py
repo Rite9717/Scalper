@@ -132,17 +132,37 @@ def _snapshot(**overrides: object) -> RiskSnapshot:
     return RiskSnapshot(**values)  # type: ignore[arg-type]
 
 
-def _engine(broker: FakeBroker, **kwargs: object) -> ExecutionEngine:
-    return ExecutionEngine(
-        broker,
-        _snapshot(),
-        tradingsymbol=SYMBOL,
-        exchange=EXCHANGE,
-        lot_size=LOT,
-        kill_file=Path("KILL"),
-        monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
-        **kwargs,  # type: ignore[arg-type]
-    )
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _engine(broker: FakeBroker, **kwargs: object) -> tuple[ExecutionEngine, FakeClock]:
+    clock = FakeClock()
+    values: dict[str, object] = {
+        "tradingsymbol": SYMBOL,
+        "exchange": EXCHANGE,
+        "lot_size": LOT,
+        "tick_size": TICK,
+        "kill_file": Path("KILL"),
+        "monitor": Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
+        "flatten_timeout": 5.0,
+        "flatten_poll_interval": 0.5,
+        "flatten_worst_price": Decimal("50"),
+        "clock": clock.monotonic,
+        "sleep": clock.sleep,
+    }
+    values.update(kwargs)
+    engine = ExecutionEngine(broker, _snapshot(), **values)  # type: ignore[arg-type]
+    return engine, clock
 
 
 async def _open_long(engine: ExecutionEngine, broker: FakeBroker) -> str:
@@ -165,7 +185,7 @@ def test_an_entry_can_be_rejected_after_the_broker_returns_an_id() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
         broker.reject_on_book = True
-        engine = _engine(broker)
+        engine, _clock = _engine(broker)
         result = await engine.submit_entry(
             side="buy",
             limit_price=Decimal("100"),
@@ -186,7 +206,7 @@ def test_an_entry_can_be_rejected_after_the_broker_returns_an_id() -> None:
 def test_a_fill_that_arrives_during_cancel_stays_on_the_position() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(broker)
+        engine, _clock = _engine(broker)
         placed = await engine.submit_entry(
             side="buy",
             limit_price=Decimal("100"),
@@ -208,7 +228,7 @@ def test_a_fill_that_arrives_during_cancel_stays_on_the_position() -> None:
 def test_flatten_rejected_leaves_the_position_unmanaged() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(broker)
+        engine, _clock = _engine(broker)
         await _open_long(engine, broker)
         broker.reject_on_book = True
         try:
@@ -227,7 +247,7 @@ def test_flatten_rejected_leaves_the_position_unmanaged() -> None:
 def test_flatten_partial_then_complete_ends_flat() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(broker, flatten_timeout=1.0)
+        engine, _clock = _engine(broker, flatten_timeout=1.0)
         await _open_long(engine, broker)
         seen: list[int] = []
         original = broker.get_orders
@@ -261,7 +281,7 @@ def test_flatten_partial_then_complete_ends_flat() -> None:
 def test_flatten_that_never_fills_reports_the_order_and_remaining_size() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(broker, flatten_timeout=0.0, flatten_worst_price=Decimal("101"))
+        engine, _clock = _engine(broker, flatten_timeout=1.0, flatten_worst_price=Decimal("101"))
         await _open_long(engine, broker)
         try:
             await engine.shutdown(Decimal("101"))
@@ -280,12 +300,20 @@ def test_flatten_that_never_fills_reports_the_order_and_remaining_size() -> None
 def test_flatten_reprice_stops_at_the_configured_worst_price() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(
+        engine, clock = _engine(
             broker,
-            flatten_timeout=0.0,
-            flatten_reprice_step=TICK,
+            flatten_timeout=3.0,
+            flatten_poll_interval=0.5,
             flatten_worst_price=Decimal("100.90"),
         )
+        modified_at: list[float] = []
+        original = broker.modify_price
+
+        async def timed(order_id: str, limit_price: Decimal) -> ManagedOrder:
+            modified_at.append(clock.now)
+            return await original(order_id, limit_price)
+
+        broker.modify_price = timed  # type: ignore[method-assign]
         await _open_long(engine, broker)
         try:
             await engine.shutdown(Decimal("101"))
@@ -295,6 +323,9 @@ def test_flatten_reprice_stops_at_the_configured_worst_price() -> None:
         else:
             raise AssertionError("repriced flatten was marked flat")
         assert broker.modify_prices == [Decimal("100.95"), Decimal("100.90")]
+        assert modified_at == [0.0, 0.5]
+        assert clock.sleeps[0] == 0.5
+        assert modified_at[1] - modified_at[0] >= engine.flatten_poll_interval
 
     asyncio.run(scenario())
 
@@ -302,11 +333,10 @@ def test_flatten_reprice_stops_at_the_configured_worst_price() -> None:
 def test_flatten_reprice_stops_after_twenty_five_steps() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(
+        engine, _clock = _engine(
             broker,
-            flatten_timeout=0.0,
-            flatten_reprice_step=TICK,
-            flatten_worst_price=Decimal("0"),
+            flatten_timeout=1.0,
+            flatten_worst_price=Decimal("90"),
         )
         await _open_long(engine, broker)
         try:
@@ -324,7 +354,7 @@ def test_flatten_reprice_stops_after_twenty_five_steps() -> None:
 def test_unknown_broker_orders_at_shutdown_are_named() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(broker)
+        engine, _clock = _engine(broker)
         broker.orders["stranger"] = ManagedOrder(
             tag="",
             side="buy",
@@ -348,7 +378,7 @@ def test_unknown_broker_orders_at_shutdown_are_named() -> None:
 def test_other_instruments_are_ignored_for_position_rejects_and_shutdown() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(broker)
+        engine, _clock = _engine(broker)
         broker.orders["other"] = ManagedOrder(
             tag="",
             side="buy",
@@ -383,7 +413,7 @@ def test_other_instruments_are_ignored_for_position_rejects_and_shutdown() -> No
 def test_a_foreign_tag_on_this_instrument_blocks_entries() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(broker)
+        engine, _clock = _engine(broker)
         broker.orders["manual"] = ManagedOrder(
             tag="manual",
             side="buy",
@@ -418,7 +448,7 @@ def test_a_foreign_tag_on_this_instrument_blocks_entries() -> None:
 def test_a_position_mismatch_halts_new_entries() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine = _engine(broker)
+        engine, _clock = _engine(broker)
 
         async def wrong_positions() -> PositionBook:
             return PositionBook(
