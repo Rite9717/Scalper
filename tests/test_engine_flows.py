@@ -19,7 +19,9 @@ from scalper.execution.broker import (
     PositionBook,
 )
 from scalper.execution.engine import ExecutionEngine, PositionMismatch, UnmanagedPosition
+from scalper.execution.errors import AmbiguousOrderOutcome
 from scalper.execution.halt import entries_halted
+from scalper.risk.killfile import is_killed
 from scalper.execution.states import ManagedOrder, OrderStatus
 from scalper.monitor.alerts import Monitor, RecordingSink
 from scalper.monitor.metrics import build_metrics
@@ -42,13 +44,16 @@ class FakeBroker:
         self.reject_on_book = False
         self.cancel_fill: int | None = None
         self.track_modifications = True
+        self.omit_from_book = False
+        self.order_reads = 0
 
     async def place_limit(self, order: ManagedOrder) -> PlaceOutcome:
         self._sequence += 1
         order_id = f"id-{self._sequence}"
         opened = replace(order, status=OrderStatus.OPEN, broker_order_id=order_id)
         stored = replace(opened, status=OrderStatus.REJECTED) if self.reject_on_book else opened
-        self.orders[order_id] = stored
+        if not self.omit_from_book:
+            self.orders[order_id] = stored
         return PlaceOutcome(opened)
 
     async def cancel(self, order_id: str) -> ManagedOrder:
@@ -78,6 +83,7 @@ class FakeBroker:
         return replace(current, limit_price=Decimal("1"))
 
     async def get_orders(self) -> list[ManagedOrder]:
+        self.order_reads += 1
         return list(self.orders.values())
 
     async def get_positions(self) -> PositionBook:
@@ -407,6 +413,39 @@ def test_unknown_broker_orders_at_shutdown_are_named() -> None:
             assert "stranger" in str(exc)
         else:
             raise AssertionError("unknown order was ignored")
+
+    asyncio.run(scenario())
+
+
+def test_a_missing_tag_after_placement_engages_halt_and_kill() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+        broker.omit_from_book = True
+        engine, clock = _engine(broker)
+        with pytest.raises(AmbiguousOrderOutcome, match="not on the order book"):
+            await engine.submit_entry(
+                side="buy",
+                limit_price=Decimal("100"),
+                quantity=LOT,
+                stop_price=Decimal("99"),
+                strategy_id="trend",
+                timestamp_ms=11_000,
+            )
+        assert entries_halted()
+        assert is_killed(Path("KILL"))
+        assert engine.monitor.sink.messages
+        assert "Kill switch" in engine.monitor.sink.messages[0]
+        assert broker.order_reads == 6
+        assert clock.sleeps == [1.25, 1.25, 1.25, 1.25]
+        refused = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=12_000,
+        )
+        assert refused.order is None
 
     asyncio.run(scenario())
 

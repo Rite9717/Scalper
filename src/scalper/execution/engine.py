@@ -17,7 +17,12 @@ from scalper.execution.broker import Broker
 from scalper.execution.errors import AmbiguousOrderOutcome
 from scalper.execution.halt import entries_halted, entry_halt_reason, halt_new_entries
 from scalper.execution.states import TERMINAL, IllegalTransition, ManagedOrder, OrderStatus
-from scalper.execution.submit import place_live_limit
+from scalper.execution.submit import (
+    _BOOK_CONFIRM_READS,
+    _BOOK_CONFIRM_WINDOW_SECONDS,
+    close_on_ambiguous,
+    place_live_limit,
+)
 from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
 from scalper.kite.tags import make_order_tag
 from scalper.monitor.alerts import Monitor
@@ -365,14 +370,32 @@ class ExecutionEngine:
             )
         except AmbiguousOrderOutcome:
             raise
-        book = await self.refresh()
-        matches = [order for order in book if order.tag == tag]
-        if len(matches) != 1:
-            raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {tag}")
-        booked = matches[0]
+        booked = await self._confirm_tag(tag)
         self.orders[tag] = booked
         self._note_reject(booked)
         return SubmitResult(booked, decision)
+
+    async def _confirm_tag(self, tag: str) -> ManagedOrder:
+        interval = _BOOK_CONFIRM_WINDOW_SECONDS / (_BOOK_CONFIRM_READS - 1)
+        for attempt in range(_BOOK_CONFIRM_READS):
+            if attempt:
+                await self._sleep(interval)
+            book = await self.refresh()
+            matches = [order for order in book if order.tag == tag and self._same_instrument(order)]
+            if len(matches) > 1:
+                await close_on_ambiguous(
+                    f"more than one order uses tag {tag}",
+                    kill_file=self.kill_file,
+                    monitor=self.monitor,
+                )
+            if len(matches) == 1:
+                return matches[0]
+        await close_on_ambiguous(
+            f"placed tag {tag} is not on the order book",
+            kill_file=self.kill_file,
+            monitor=self.monitor,
+        )
+        raise AssertionError("close_on_ambiguous returns")
 
     async def _count_modify(self, order_id: str, limit_price: Decimal) -> None:
         await self.broker.modify_price(order_id, limit_price)
