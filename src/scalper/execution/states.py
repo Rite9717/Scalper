@@ -44,6 +44,9 @@ class ManagedOrder:
     modifications: int = 0
     broker_order_id: str | None = None
     intent: str = "entry"
+    tradingsymbol: str = ""
+    exchange: str = ""
+    product: str = "MIS"
 
     @property
     def remaining(self) -> int:

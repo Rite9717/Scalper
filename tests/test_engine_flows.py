@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+
+import pytest
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -9,8 +11,15 @@ from pathlib import Path
 from prometheus_client import CollectorRegistry
 
 from scalper.clock import IST
-from scalper.execution.broker import BrokerMargins, MarginSegment, PlaceOutcome, PositionBook
-from scalper.execution.engine import ExecutionEngine, UnmanagedPosition
+from scalper.execution.broker import (
+    BrokerMargins,
+    BrokerPosition,
+    MarginSegment,
+    PlaceOutcome,
+    PositionBook,
+)
+from scalper.execution.engine import ExecutionEngine, PositionMismatch, UnmanagedPosition
+from scalper.execution.halt import entries_halted
 from scalper.execution.states import ManagedOrder, OrderStatus
 from scalper.monitor.alerts import Monitor, RecordingSink
 from scalper.monitor.metrics import build_metrics
@@ -18,6 +27,8 @@ from scalper.risk.gate import RiskSnapshot
 
 TICK = Decimal("0.05")
 LOT = 15
+SYMBOL = "NIFTY26OCTFUT"
+EXCHANGE = "NFO"
 NOW = datetime(2026, 10, 27, 10, 0, tzinfo=IST)
 
 
@@ -68,7 +79,17 @@ class FakeBroker:
         return list(self.orders.values())
 
     async def get_positions(self) -> PositionBook:
-        return PositionBook((), ())
+        nets: dict[tuple[str, str], int] = {}
+        for order in self.orders.values():
+            signed = order.filled_quantity if order.side == "buy" else -order.filled_quantity
+            key = (order.tradingsymbol, order.exchange)
+            nets[key] = nets.get(key, 0) + signed
+        positions = tuple(
+            BrokerPosition(symbol, exchange, "MIS", quantity, Decimal("0"), 0)
+            for (symbol, exchange), quantity in nets.items()
+            if quantity != 0
+        )
+        return PositionBook(positions, ())
 
     async def get_margins(self) -> BrokerMargins:
         empty = MarginSegment(False, Decimal("0"), Decimal("0"), Decimal("0"))
@@ -115,6 +136,8 @@ def _engine(broker: FakeBroker, **kwargs: object) -> ExecutionEngine:
     return ExecutionEngine(
         broker,
         _snapshot(),
+        tradingsymbol=SYMBOL,
+        exchange=EXCHANGE,
         lot_size=LOT,
         kill_file=Path("KILL"),
         monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
@@ -309,6 +332,8 @@ def test_unknown_broker_orders_at_shutdown_are_named() -> None:
             quantity=LOT,
             status=OrderStatus.OPEN,
             broker_order_id="stranger",
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
         )
         try:
             await engine.shutdown(Decimal("100"))
@@ -316,5 +341,104 @@ def test_unknown_broker_orders_at_shutdown_are_named() -> None:
             assert "stranger" in str(exc)
         else:
             raise AssertionError("unknown order was ignored")
+
+    asyncio.run(scenario())
+
+
+def test_other_instruments_are_ignored_for_position_rejects_and_shutdown() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+        engine = _engine(broker)
+        broker.orders["other"] = ManagedOrder(
+            tag="",
+            side="buy",
+            limit_price=Decimal("200"),
+            quantity=LOT,
+            filled_quantity=LOT,
+            status=OrderStatus.FILLED,
+            broker_order_id="other-1",
+            tradingsymbol="BANKNIFTY26OCTFUT",
+            exchange=EXCHANGE,
+        )
+        broker.orders["rejected-other"] = ManagedOrder(
+            tag="manual",
+            side="buy",
+            limit_price=Decimal("200"),
+            quantity=LOT,
+            status=OrderStatus.REJECTED,
+            broker_order_id="other-2",
+            tradingsymbol="BANKNIFTY26OCTFUT",
+            exchange=EXCHANGE,
+        )
+        await engine.refresh()
+        assert engine.position_quantity == 0
+        assert engine.recent_rejects == 0
+        assert engine.foreign_orders == []
+        report = await engine.shutdown(Decimal("100"))
+        assert report.clean is True
+
+    asyncio.run(scenario())
+
+
+def test_a_foreign_tag_on_this_instrument_blocks_entries() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+        engine = _engine(broker)
+        broker.orders["manual"] = ManagedOrder(
+            tag="manual",
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            status=OrderStatus.OPEN,
+            broker_order_id="manual-1",
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+        )
+        refused = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=8_000,
+        )
+        assert refused.order is None
+        assert refused.decision.action == "halt"
+        assert [order.broker_order_id for order in engine.foreign_orders] == ["manual-1"]
+        try:
+            await engine.shutdown(Decimal("100"))
+        except UnmanagedPosition as exc:
+            assert "manual-1" in str(exc)
+        else:
+            raise AssertionError("foreign order was left unmanaged")
+
+    asyncio.run(scenario())
+
+
+def test_a_position_mismatch_halts_new_entries() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+        engine = _engine(broker)
+
+        async def wrong_positions() -> PositionBook:
+            return PositionBook(
+                (BrokerPosition(SYMBOL, EXCHANGE, "MIS", 5, Decimal("100"), 0),),
+                (),
+            )
+
+        broker.get_positions = wrong_positions  # type: ignore[method-assign]
+        with pytest.raises(PositionMismatch):
+            await engine.refresh()
+        assert entries_halted()
+        refused = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=9_000,
+        )
+        assert refused.order is None
+        assert refused.decision.allowed is False
 
     asyncio.run(scenario())

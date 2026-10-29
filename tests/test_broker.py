@@ -60,6 +60,9 @@ def _row(**overrides: object) -> dict[str, object]:
         "price": 100,
         "average_price": 0,
         "tag": "abc123",
+        "tradingsymbol": "NIFTY26OCTFUT",
+        "exchange": "NFO",
+        "product": "MIS",
     }
     row.update(overrides)
     return row
@@ -650,8 +653,10 @@ def test_a_failed_kill_file_still_blocks_the_next_entry(tmp_path) -> None:
 
     async def scenario() -> None:
         engine = ExecutionEngine(
-            PaperBroker(TICK, LOT),
+            PaperBroker(TICK, LOT, tradingsymbol="NIFTY26OCTFUT"),
             _entry_snapshot(),
+            tradingsymbol="NIFTY26OCTFUT",
+            exchange="NFO",
             lot_size=LOT,
             kill_file=tmp_path / "engine-kill",
             monitor=monitor,
@@ -705,6 +710,9 @@ def test_get_orders_maps_kite_statuses_including_partial_fills() -> None:
     orders = _run(lambda _request: _ok(rows), lambda broker: broker.get_orders())
     by_tag = {order.tag: order for order in orders}
     assert by_tag["open1"].status is OrderStatus.OPEN
+    assert by_tag["open1"].tradingsymbol == "NIFTY26OCTFUT"
+    assert by_tag["open1"].exchange == "NFO"
+    assert by_tag["open1"].product == "MIS"
     assert by_tag["part1"].status is OrderStatus.PARTIAL
     assert by_tag["part1"].filled_quantity == 5
     assert by_tag["full1"].status is OrderStatus.FILLED

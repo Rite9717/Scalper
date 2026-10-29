@@ -14,7 +14,7 @@ from pathlib import Path
 
 from scalper.execution.broker import Broker
 from scalper.execution.errors import AmbiguousOrderOutcome
-from scalper.execution.halt import entries_halted, entry_halt_reason
+from scalper.execution.halt import entries_halted, entry_halt_reason, halt_new_entries
 from scalper.execution.states import TERMINAL, ManagedOrder, OrderStatus, note_modification
 from scalper.execution.submit import place_live_limit
 from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
@@ -25,6 +25,13 @@ from scalper.risk.gate import Intent, RiskDecision, RiskSnapshot, assess
 
 class UnmanagedPosition(RuntimeError):
     """Shutdown stopped because a position or an unknown order is still open."""
+
+
+class PositionMismatch(RuntimeError):
+    """The broker's net quantity for this instrument does not match filled orders."""
+
+
+_PRODUCT = "MIS"
 
 
 @dataclass(frozen=True)
@@ -45,6 +52,8 @@ class ExecutionEngine:
         broker: Broker,
         snapshot: RiskSnapshot,
         *,
+        tradingsymbol: str,
+        exchange: str,
         lot_size: int,
         kill_file: Path,
         monitor: Monitor,
@@ -53,6 +62,8 @@ class ExecutionEngine:
         flatten_reprice_step: Decimal = Decimal("0.05"),
         flatten_worst_price: Decimal | None = None,
     ) -> None:
+        if not tradingsymbol or not exchange:
+            raise ValueError("tradingsymbol and exchange are required")
         if lot_size < 1:
             raise ValueError("lot size must be positive")
         if flatten_timeout < 0 or flatten_poll_interval < 0:
@@ -61,6 +72,8 @@ class ExecutionEngine:
             raise ValueError("flatten reprice step must not be negative")
         self.broker = broker
         self.snapshot = snapshot
+        self.tradingsymbol = tradingsymbol
+        self.exchange = exchange
         self.lot_size = lot_size
         self.kill_file = kill_file
         self.monitor = monitor
@@ -69,8 +82,10 @@ class ExecutionEngine:
         self.flatten_reprice_step = flatten_reprice_step
         self.flatten_worst_price = flatten_worst_price
         self.orders: dict[str, ManagedOrder] = {}
+        self.foreign_orders: list[ManagedOrder] = []
         self.position_quantity = 0
         self.unmanaged: list[str] = []
+        self._our_tags: set[str] = set()
         self.recent_rejects = snapshot.recent_rejects
         self._reject_ids: set[str] = set()
         self._replace_sequence = 1
@@ -163,37 +178,48 @@ class ExecutionEngine:
 
     async def refresh(self) -> list[ManagedOrder]:
         book = await self.broker.get_orders()
-        by_id = {order.broker_order_id: order for order in book if order.broker_order_id}
-        for tag, local in list(self.orders.items()):
-            match = by_id.get(local.broker_order_id or "")
-            if match is not None:
-                self.orders[tag] = match
+        ours: list[ManagedOrder] = []
+        foreign: list[ManagedOrder] = []
         for order in book:
-            self._note_reject(order)
-        self.position_quantity = _net_filled(book)
+            if not self._same_instrument(order):
+                continue
+            if order.tag and order.tag in self._our_tags:
+                ours.append(order)
+                self.orders[order.tag] = order
+                self._note_reject(order)
+            else:
+                foreign.append(order)
+        self.foreign_orders = foreign
+        self.position_quantity = _net_filled(ours)
+        await self._check_broker_position()
         return book
 
     async def recover(self) -> None:
         book = await self.broker.get_orders()
         self.orders.clear()
+        self.foreign_orders.clear()
         self.unmanaged.clear()
+        self._our_tags.clear()
         for order in book:
+            if not self._same_instrument(order):
+                continue
             if order.tag and order.broker_order_id:
+                self._our_tags.add(order.tag)
                 self.orders[order.tag] = order
+                self._note_reject(order)
             elif order.broker_order_id:
-                self.unmanaged.append(order.broker_order_id)
-        self.position_quantity = _net_filled(book)
-        for order in book:
-            self._note_reject(order)
+                self.foreign_orders.append(order)
+        self.position_quantity = _net_filled(list(self.orders.values()))
+        await self._check_broker_position()
 
     async def shutdown(self, last_price: Decimal | None) -> ShutdownReport:
         book = await self.refresh()
-        self._raise_for_unknown(book)
+        self._raise_for_foreign()
         for order in list(self.orders.values()):
             if order.working and order.broker_order_id:
                 await self.broker.cancel(order.broker_order_id)
                 book = await self.refresh()
-        self._raise_for_unknown(book)
+        self._raise_for_foreign()
         if self.position_quantity == 0:
             return ShutdownReport(True, 0)
         if last_price is None:
@@ -254,11 +280,15 @@ class ExecutionEngine:
         if sequence is None:
             sequence = 0
         tag = make_order_tag(timestamp_ms=timestamp_ms, strategy_id=strategy_id, sequence=sequence)
+        if intent is Intent.ENTRY and entries_halted():
+            return SubmitResult(None, RiskDecision(False, "halt", entry_halt_reason()))
+        await self.refresh()
+        if intent is Intent.ENTRY and self.foreign_orders:
+            foreign_id = self.foreign_orders[0].broker_order_id or "unknown"
+            return SubmitResult(None, RiskDecision(False, "halt", f"foreign order {foreign_id}"))
         existing = self.orders.get(tag)
         if existing is not None:
             return SubmitResult(existing, RiskDecision(True, "allow", "duplicate tag"))
-        if intent is Intent.ENTRY and entries_halted():
-            return SubmitResult(None, RiskDecision(False, "halt", entry_halt_reason()))
         lots = max(1, quantity // self.lot_size)
         open_lots = abs(self.position_quantity) // self.lot_size
         decision = assess(
@@ -273,6 +303,7 @@ class ExecutionEngine:
         )
         if not decision.allowed:
             return SubmitResult(None, decision)
+        self._our_tags.add(tag)
         try:
             await place_live_limit(
                 self.broker,
@@ -282,6 +313,9 @@ class ExecutionEngine:
                     limit_price=limit_price,
                     quantity=quantity,
                     intent=intent.value,
+                    tradingsymbol=self.tradingsymbol,
+                    exchange=self.exchange,
+                    product=_PRODUCT,
                 ),
                 kill_file=self.kill_file,
                 monitor=self.monitor,
@@ -303,7 +337,12 @@ class ExecutionEngine:
                 return order
         raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
 
+    def _same_instrument(self, order: ManagedOrder) -> bool:
+        return order.tradingsymbol == self.tradingsymbol and order.exchange == self.exchange
+
     def _note_reject(self, order: ManagedOrder) -> None:
+        if not self._same_instrument(order) or not order.tag or order.tag not in self._our_tags:
+            return
         if order.status is not OrderStatus.REJECTED or not order.broker_order_id:
             return
         if order.broker_order_id in self._reject_ids:
@@ -312,17 +351,26 @@ class ExecutionEngine:
         self.recent_rejects += 1
         self.snapshot = replace(self.snapshot, recent_rejects=self.recent_rejects)
 
-    def _raise_for_unknown(self, book: list[ManagedOrder]) -> None:
-        known = {order.broker_order_id for order in self.orders.values() if order.broker_order_id}
-        found: list[str] = []
-        for order in book:
-            if not order.broker_order_id:
-                continue
-            if order.broker_order_id not in known or not order.tag:
-                found.append(order.broker_order_id)
-        ids = list(dict.fromkeys([*self.unmanaged, *found]))
-        if ids:
-            raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {', '.join(ids)}")
+    def _raise_for_foreign(self) -> None:
+        if not self.foreign_orders:
+            return
+        ids = [order.broker_order_id or "unknown" for order in self.foreign_orders]
+        raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {', '.join(ids)}")
+
+    async def _check_broker_position(self) -> None:
+        positions = await self.broker.get_positions()
+        broker_qty = sum(
+            position.quantity
+            for position in positions.net
+            if position.tradingsymbol == self.tradingsymbol and position.exchange == self.exchange
+        )
+        if broker_qty == self.position_quantity:
+            return
+        reason = (
+            f"position mismatch {self.tradingsymbol}: broker {broker_qty} fills {self.position_quantity}"
+        )
+        halt_new_entries(reason)
+        raise PositionMismatch(reason)
 
 
 def _net_filled(book: list[ManagedOrder]) -> int:

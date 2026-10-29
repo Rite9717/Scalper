@@ -25,6 +25,8 @@ from scalper.risk.gate import RiskSnapshot
 NOW = datetime(2026, 10, 27, 10, 0, tzinfo=IST)
 TICK = Decimal("0.05")
 LOT = 15
+SYMBOL = "NIFTY26OCTFUT"
+EXCHANGE = "NFO"
 
 
 def _snapshot(**overrides: object) -> RiskSnapshot:
@@ -64,7 +66,7 @@ class _FillOnRead(PaperBroker):
     """Paper book that prints one price whenever the engine reads the book."""
 
     def __init__(self, price: Decimal) -> None:
-        super().__init__(TICK, LOT)
+        super().__init__(TICK, LOT, tradingsymbol=SYMBOL)
         self.print_price = price
 
     async def get_orders(self) -> list[ManagedOrder]:
@@ -78,8 +80,10 @@ def _engine(
     **kwargs: object,
 ) -> ExecutionEngine:
     return ExecutionEngine(
-        broker or PaperBroker(TICK, LOT),
+        broker or PaperBroker(TICK, LOT, tradingsymbol=SYMBOL),
         snapshot or _snapshot(),
+        tradingsymbol=SYMBOL,
+        exchange=EXCHANGE,
         lot_size=LOT,
         kill_file=Path("KILL"),
         monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
@@ -219,7 +223,7 @@ def test_kill_switch_blocks_the_entry_and_shutdown_flattens_a_long() -> None:
 
 def test_shutdown_refuses_an_unknown_broker_order() -> None:
     async def scenario() -> None:
-        broker = PaperBroker(TICK, LOT)
+        broker = PaperBroker(TICK, LOT, tradingsymbol=SYMBOL)
         broker.orders["stranger"] = ManagedOrder(
             tag="",
             side="buy",
@@ -227,6 +231,8 @@ def test_shutdown_refuses_an_unknown_broker_order() -> None:
             quantity=LOT,
             status=OrderStatus.OPEN,
             broker_order_id="broker-9",
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
         )
         engine = _engine(broker=broker)
         with pytest.raises(UnmanagedPosition, match="broker-9"):
@@ -246,6 +252,8 @@ def test_recovery_adopts_a_filled_order_and_can_flatten_it() -> None:
             filled_quantity=LOT,
             status=OrderStatus.FILLED,
             broker_order_id="broker-1",
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
         )
         engine = _engine(broker=broker)
         await engine.recover()

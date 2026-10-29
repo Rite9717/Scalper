@@ -53,6 +53,9 @@ def map_kite_order(row: dict[str, Any]) -> ManagedOrder:
         average_price=_decimal(row, "average_price"),
         status=_status(status_text, quantity, filled),
         broker_order_id=str(order_id),
+        tradingsymbol=_text(row, "tradingsymbol"),
+        exchange=_text(row, "exchange"),
+        product=_text(row, "product"),
     )
 
 
