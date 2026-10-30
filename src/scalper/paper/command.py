@@ -21,7 +21,7 @@ from scalper.data.candles import MinuteBook
 from scalper.data.migrate import apply_migrations
 from scalper.data.models import NormalizedQuote
 from scalper.data.normalize import QuoteRejected, normalize_full_tick
-from scalper.data.ticker import connect_kite_ticker
+from scalper.data.ticker import close_ticker, connect_kite_ticker
 from scalper.execution.engine import ExecutionEngine
 from scalper.execution.paper import PaperBroker
 from scalper.execution.snapshot import LiveSnapshotProvider
@@ -133,22 +133,36 @@ async def run_paper(settings: Settings, strategy_name: str) -> int:
     loop = asyncio.get_running_loop()
     bridge = AsyncTickerBridge(loop, asyncio.Queue())
     install_stop_signals(loop, runner)
-    connect_kite_ticker(
+    ticker = connect_kite_ticker(
         api_key=session.api_key,
         access_token=session.access_token.get_secret_value(),
         bridge=bridge,
         instrument_token=contract.instrument_token,
     )
     feed = _KiteQuotes(bridge, contract.tick_size, contract.instrument_token)
+    await serve_paper(runner, feed, ticker, health, connection)
+    return 0
+
+
+async def serve_paper(runner: PaperRunner, feed, ticker: object, health: HealthServer, connection) -> None:
+    """Run the loop, then close the ticker before the database connection."""
     try:
         await runner.run(feed)
     except BaseException as exc:
         await runner.fail_closed(exc)
         raise
     finally:
-        await health.stop()
-        await connection.close()
-    return 0
+        await finish_paper_session(ticker, health, connection)
+
+
+async def finish_paper_session(ticker: object, health: HealthServer, connection) -> None:
+    try:
+        close_ticker(ticker)
+    finally:
+        try:
+            await health.stop()
+        finally:
+            await connection.close()
 
 
 def _sink(settings: Settings):

@@ -51,3 +51,15 @@ def connect_kite_ticker(
     ticker.on_error = bridge.on_error
     ticker.connect(threaded=True)
     return ticker
+
+
+def close_ticker(ticker: object) -> None:
+    """Close the websocket and stop the ticker thread. Each call is attempted."""
+    for name in ("close", "stop"):
+        method = getattr(ticker, name, None)
+        if method is None:
+            continue
+        try:
+            method()
+        except Exception:
+            continue

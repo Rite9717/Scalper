@@ -468,6 +468,44 @@ def _session(path: Path, *, expires: datetime) -> None:
     )
 
 
+def test_a_runner_error_closes_the_ticker_before_the_database() -> None:
+    async def scenario() -> None:
+        order: list[str] = []
+
+        class Ticker:
+            def close(self) -> None:
+                order.append("close")
+
+            def stop(self) -> None:
+                order.append("stop")
+
+        class Health:
+            async def stop(self) -> None:
+                order.append("health")
+
+        class Connection:
+            async def close(self) -> None:
+                assert order[:2] == ["close", "stop"]
+                order.append("database")
+
+        runner, _journal, _clock = _runner(strategy=_Script([]))
+
+        async def explode(_feed):
+            raise RuntimeError("runner down")
+
+        runner.run = explode  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="runner down"):
+            await serve(runner, Ticker(), Health(), Connection())
+        assert order == ["close", "stop", "health", "database"]
+
+    async def serve(runner, ticker, health, connection) -> None:
+        from scalper.paper.command import serve_paper
+
+        await serve_paper(runner, _stream([]), ticker, health, connection)
+
+    asyncio.run(scenario())
+
+
 def test_startup_refuses_when_the_kill_file_exists(tmp_path: Path) -> None:
     kill = tmp_path / "KILL"
     engage(kill, "manual")
