@@ -24,6 +24,7 @@ from scalper import PHASE, __version__
 from scalper.backtest.costs import ChargeSchedule
 from scalper.backtest.engine import BacktestSpec, load_candles, run_backtest
 from scalper.backtest.report import result_report, windows_covering
+from scalper.ops.doctor import collect_status, paper_ready, render_doctor
 from scalper.ops.go_live import render_checklist
 from scalper.risk.killfile import KillFileError, engage, kill_path, release
 from scalper.execution.engine import UnmanagedPosition
@@ -36,6 +37,7 @@ from scalper.clock import IST, now_ist, today_ist
 from scalper.compliance import ComplianceError, LIVE_CONFIRMATION_PHRASE, position_lot_cap
 from scalper.data.migrate import apply_migrations
 from scalper.data.service import DataStoreError, download_history, record_until_stopped
+from scalper.data.stored import fetch_stored_candles
 from scalper.config import Settings, load_settings
 from scalper.health import HealthServer, http_health_payload
 from scalper.kite.auth import exchange_request_token
@@ -105,13 +107,21 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--date", required=True, help="YYYY-MM-DD recorded session.")
     compare.add_argument("--strategy", required=True, choices=("trend_pullback", "vwap_reversion"))
 
-    backtest = sub.add_parser("backtest", help="Replay a candle file. The plumbing strategy claims no edge.")
-    backtest.add_argument("--candles", required=True, type=Path)
-    backtest.add_argument("--tick", required=True, help="Contract tick size, for example 0.05.")
-    backtest.add_argument("--lot", required=True, type=int, help="Contract lot size from the instrument master.")
+    backtest = sub.add_parser("backtest", help="Replay candles from a file or from candles already stored in Timescale.")
+    backtest.add_argument("--candles", type=Path, default=None, help="Candle CSV. Omit this when using --stored.")
+    backtest.add_argument("--stored", action="store_true", help="Read minute candles already stored by history or record.")
+    backtest.add_argument("--csv", type=Path, default=None, help="Instrument master. Required with --stored. Supplies tick and lot.")
+    backtest.add_argument("--from", dest="start", default=None, help="YYYY-MM-DD. Required with --stored.")
+    backtest.add_argument("--to", dest="end", default=None, help="YYYY-MM-DD, inclusive. Required with --stored.")
+    backtest.add_argument("--interval", default="minute")
+    backtest.add_argument("--as-of", dest="as_of", default=None)
+    backtest.add_argument("--tick", default=None, help="Contract tick size. Required with --candles. Defaults from --csv.")
+    backtest.add_argument("--lot", type=int, default=None, help="Contract lot size. Required with --candles. Defaults from --csv.")
     backtest.add_argument("--lots", type=int, default=1)
     backtest.add_argument("--window-days", type=int, default=20)
     backtest.add_argument("--strategy", default="plumbing", choices=STRATEGY_NAMES)
+
+    sub.add_parser("doctor", help="Print the manual steps still left before paper trading.")
 
     kill = sub.add_parser("kill", help="Refuse every new entry until an explicit resume.")
     kill.add_argument("--reason", default="manual")
@@ -317,6 +327,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "go-live":
             sys.stdout.write(render_checklist())
             return 2
+        if args.command == "doctor":
+            checks = await_doctor(settings)
+            sys.stdout.write(render_doctor(checks))
+            return 0 if paper_ready(checks) else 2
     except PaperStartupError as exc:
         structlog.get_logger().error("paper_startup_refused", reason=str(exc))
         return 2
@@ -405,17 +419,65 @@ async def _exchange(settings: Settings) -> int:
     return 0
 
 
-def _run_backtest(settings: Settings, args: argparse.Namespace) -> int:
+def await_doctor(settings: Settings):
+    return asyncio.run(collect_status(settings))
+
+
+def _range_end(raw: str) -> datetime:
+    end = _parse_moment(raw)
+    if len(raw.strip()) == 10:
+        return end + timedelta(days=1)
+    return end
+
+
+def _backtest_bars(settings: Settings, args: argparse.Namespace) -> tuple[list, Decimal, int]:
+    if args.stored and args.candles is not None:
+        raise ComplianceError("pass either --candles or --stored, not both")
+    if args.lots <= 0 or args.window_days <= 0:
+        raise ComplianceError("lots and window-days must be positive")
+    if args.stored:
+        if not args.start or not args.end:
+            raise ComplianceError("backtest --stored requires --from and --to")
+        if args.csv is None:
+            raise ComplianceError("backtest --stored requires --csv for the instrument master")
+        contract = _contract_from_csv(args.csv, _parse_as_of(args.as_of))
+        try:
+            tick_size = Decimal(args.tick) if args.tick else contract.tick_size
+        except Exception as exc:
+            raise ComplianceError("tick must be a decimal such as 0.05") from exc
+        lot_size = args.lot if args.lot else contract.lot_size
+        if lot_size <= 0:
+            raise ComplianceError("lot must be positive")
+        bars = asyncio.run(
+            fetch_stored_candles(
+                settings.database_url.get_secret_value(),
+                instrument_token=contract.instrument_token,
+                interval=args.interval,
+                start=_parse_moment(args.start),
+                end=_range_end(args.end),
+            )
+        )
+        if not bars:
+            raise ComplianceError(f"no stored {args.interval} candles from {args.start} to {args.end}")
+        return bars, tick_size, lot_size
+    if args.candles is None:
+        raise ComplianceError("backtest requires --candles or --stored")
+    if not args.tick or args.lot is None:
+        raise ComplianceError("backtest --candles requires --tick and --lot")
     try:
         tick_size = Decimal(args.tick)
     except Exception as exc:
         raise ComplianceError("tick must be a decimal such as 0.05") from exc
-    if args.lot <= 0 or args.lots <= 0 or args.window_days <= 0:
-        raise ComplianceError("lot, lots, and window-days must be positive")
-    bars = load_candles(args.candles)
+    if args.lot <= 0:
+        raise ComplianceError("lot must be positive")
+    return load_candles(args.candles), tick_size, args.lot
+
+
+def _run_backtest(settings: Settings, args: argparse.Namespace) -> int:
+    bars, tick_size, lot_size = _backtest_bars(settings, args)
     spec = BacktestSpec(
         tick_size=tick_size,
-        lot_size=args.lot,
+        lot_size=lot_size,
         lots=args.lots,
         charges=ChargeSchedule(
             brokerage_rate=settings.brokerage_rate,

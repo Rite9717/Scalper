@@ -1,7 +1,7 @@
 [project]
 name = "scalper"
 version = "0.1.0"
-description = "Personal Nifty 50 futures intraday scalping system. Phase 2 records Nifty futures ticks and depth."
+description = "Personal Nifty 50 futures intraday scalping system. Paper trading is ready; live orders stay off."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

@@ -25,7 +25,7 @@ sudo mkdir -p /opt/scalper
 sudo chown 10001:10001 /opt/scalper/data
 ```
 
-Copy the repository to `/opt/scalper`. Copy `.env.example` to `.env` and set:
+Copy the repository to `/opt/scalper`. Copy `.env.example` to `.env` beside `docker-compose.yml` and set:
 
 - `SCALPER_EXPECTED_USER_ID`
 - `SCALPER_KITE_API_KEY`

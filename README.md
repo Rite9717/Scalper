@@ -10,6 +10,25 @@ SCALPER_LIVE_CONFIRMATION=I_CONFIRM_LIVE_TRADING_FOR_MY_ACCOUNT_ONLY
 
 Live size is one lot. That cap is code, not a setting.
 
+## What you do by hand
+
+The program is finished. These steps stay yours because they need your Zerodha account, your browser, and real market days:
+
+1. Copy `.env.example` to `.env`. Set `SCALPER_EXPECTED_USER_ID`, `SCALPER_KITE_API_KEY`, and `SCALPER_KITE_API_SECRET`. Leave `SCALPER_TRADING_MODE=paper`.
+2. `docker compose up -d`, then `python -m scalper db migrate`.
+3. `python -m scalper login` and finish Zerodha's own login, including TOTP, in the browser.
+4. `python -m scalper instruments fetch`.
+5. `python -m scalper doctor`. It prints `paper ready: yes` or the exact command still left.
+6. Download research candles, then backtest the stored bars (no separate CSV of candles):
+
+```bash
+python -m scalper history --csv data/instruments/nfo-YYYY-MM-DD.csv --from YYYY-MM-DD --to YYYY-MM-DD
+python -m scalper backtest --stored --csv data/instruments/nfo-YYYY-MM-DD.csv --from YYYY-MM-DD --to YYYY-MM-DD --strategy trend_pullback
+```
+
+7. On a trading day, `python -m scalper paper --strategy trend_pullback`. Orders are not sent.
+8. `python -m scalper go-live` lists what you still have to observe yourself (a long backtest, four weeks of paper, the VPS, alerts, a backup restore). It does not turn live trading on.
+
 ## Tests
 
 ```bash
@@ -38,6 +57,7 @@ python -m scalper health
 Postgres (TimescaleDB), Redis, and a health server. Nothing in this compose file logs into Kite or sends an order.
 
 ```bash
+cp .env.example .env
 mkdir -p data
 docker compose up --build
 curl --fail http://127.0.0.1:8080/health
@@ -183,6 +203,7 @@ src/scalper/kite/callback.py     loopback browser login
 src/scalper/kite/session.py      0600 session file and 06:00 expiry
 src/scalper/kite/instruments.py  NFO dump and current NIFTY future
 src/scalper/kite/api_facts.py    numbers taken from the Kite docs
+src/scalper/ops/doctor.py        which manual steps are still left
 ```
 
-Phase 2 is the data layer and the tick/depth recorder. It has not been started.
+`python -m scalper doctor` is the list of what you still do by hand. Live trading stays off.
