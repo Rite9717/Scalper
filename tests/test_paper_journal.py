@@ -72,6 +72,13 @@ async def exercise(journal: MemoryJournal | PostgresJournal, run_id) -> None:
         fill_price=Decimal("98.90"),
         quantity=15,
     )
+    await journal.record_run_end(
+        run_id=run_id,
+        ended_at=WHEN,
+        reason="RuntimeError: feed down",
+        final_position=0,
+        kill_engaged=True,
+    )
     view = await journal.read(run_id)
     assert view["runs"][0]["limits"]["max_loss_per_trade"] == "1234"
     assert view["runs"][0]["strategy"] == "trend_pullback"
@@ -87,6 +94,9 @@ async def exercise(journal: MemoryJournal | PostgresJournal, run_id) -> None:
     assert view["exits"][0]["reason"] == "stop"
     assert view["exits"][0]["trigger_price"] == "99"
     assert view["exits"][0]["fill_price"] == "98.90"
+    assert view["run_ends"][0]["reason"] == "RuntimeError: feed down"
+    assert view["run_ends"][0]["final_position"] == 0
+    assert view["run_ends"][0]["kill_engaged"] is True
 
 
 def test_memory_journal_records_the_paper_loop() -> None:
@@ -110,11 +120,13 @@ def test_paper_journal_migration_on_postgres() -> None:
             pytest.skip(f"postgres is not available: {type(exc).__name__}")
         run_id = uuid4()
         try:
-            script = files("scalper.data.sql").joinpath("003_paper_journal.sql").read_text(encoding="utf-8")
-            for statement in split_sql(script):
-                await connection.execute(statement)
+            for name in ("003_paper_journal.sql", "004_paper_run_end.sql"):
+                script = files("scalper.data.sql").joinpath(name).read_text(encoding="utf-8")
+                for statement in split_sql(script):
+                    await connection.execute(statement)
             await exercise(PostgresJournal(connection), run_id)
         finally:
+            await connection.execute("DELETE FROM paper_run_ends WHERE run_id = $1", run_id)
             await connection.execute("DELETE FROM paper_exits WHERE run_id = $1", run_id)
             await connection.execute("DELETE FROM paper_fills WHERE run_id = $1", run_id)
             await connection.execute("DELETE FROM paper_orders WHERE run_id = $1", run_id)

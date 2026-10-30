@@ -17,6 +17,7 @@ from scalper.data.cache import MemoryQuoteCache
 from scalper.data.candles import MinuteBook
 from scalper.data.models import NormalizedQuote
 from scalper.execution.engine import ExecutionEngine, UnmanagedPosition
+from scalper.execution.halt import entries_halted
 from scalper.execution.kite_broker import KiteBroker
 from scalper.execution.paper import PaperBroker
 from scalper.execution.snapshot import LiveSnapshotProvider
@@ -96,6 +97,17 @@ async def _asleep(_seconds: float) -> None:
     return None
 
 
+class _FastClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
 def _runner(
     *,
     broker: PaperBroker | None = None,
@@ -113,6 +125,7 @@ def _runner(
     if now is None:
         now = lambda: clock["now"]
     cache = MemoryQuoteCache()
+    engine_clock = _FastClock()
     broker = broker or PaperBroker(TICK, LOT, tradingsymbol="NIFTY26OCTFUT", equity_cash=Decimal("1000000"))
     monitor = Monitor(build_metrics(), RecordingSink())
     engine = ExecutionEngine(
@@ -139,7 +152,8 @@ def _runner(
         flatten_timeout=limits.flatten_timeout,
         flatten_poll_interval=limits.flatten_poll_interval,
         flatten_max_adverse_ticks=limits.flatten_max_adverse_ticks,
-        sleep=sleep,
+        clock=engine_clock.monotonic,
+        sleep=engine_clock.sleep,
     )
     journal = MemoryJournal()
     runner = PaperRunner(
@@ -587,3 +601,126 @@ def test_startup_refuses_an_unreachable_database(tmp_path: Path) -> None:
 
 async def _ping_ok() -> None:
     return None
+
+
+class _BoomJournal(MemoryJournal):
+    def __init__(self, method: str) -> None:
+        super().__init__()
+        self.method = method
+
+    async def record_order(self, **kwargs: object) -> None:
+        if self.method == "record_order":
+            raise RuntimeError("journal order")
+        await super().record_order(**kwargs)  # type: ignore[arg-type]
+
+    async def record_fill(self, **kwargs: object) -> None:
+        if self.method == "record_fill":
+            raise RuntimeError("journal fill")
+        await super().record_fill(**kwargs)  # type: ignore[arg-type]
+
+    async def record_exit(self, **kwargs: object) -> None:
+        if self.method == "record_exit":
+            raise RuntimeError("journal exit")
+        await super().record_exit(**kwargs)  # type: ignore[arg-type]
+
+
+def _assert_fail_closed(runner: PaperRunner, journal: MemoryJournal) -> None:
+    assert entries_halted()
+    assert runner.engine.position_quantity == 0 or is_killed(Path("paper-kill"))
+    assert journal.run_ends
+    assert journal.run_ends[-1]["kill_engaged"] is True
+
+
+def test_journal_order_fill_and_exit_failures_still_flatten_or_kill() -> None:
+    async def scenario(method: str, ticks: list[NormalizedQuote]) -> None:
+        from scalper.execution import halt as halt_module
+
+        halt_module._halted = False
+        halt_module._reason = ""
+        kill = Path("paper-kill")
+        if kill.exists():
+            kill.unlink()
+        runner, _journal, clock = _runner(strategy=_Script([_good_signal()]))
+        boom = _BoomJournal(method)
+        runner.journal = boom
+
+        async def source():
+            for tick in ticks:
+                clock["now"] = tick.received_at
+                yield tick
+            yield Stop()
+
+        with pytest.raises(RuntimeError, match="journal"):
+            await runner.run(source())
+        _assert_fail_closed(runner, boom)
+
+    ticks = [
+        _quote(DAY, "100", 10),
+        _quote(DAY + timedelta(minutes=1), "100.05", 20),
+        _quote(DAY + timedelta(minutes=2), "99.90", 30),
+        _quote(DAY + timedelta(minutes=3), "99", 40),
+        _quote(DAY + timedelta(minutes=4), "99.10", 50),
+    ]
+    asyncio.run(scenario("record_order", ticks[:2]))
+    asyncio.run(scenario("record_fill", ticks[:3]))
+    asyncio.run(scenario("record_exit", ticks))
+
+
+def test_an_engine_error_mid_loop_is_fail_closed() -> None:
+    async def scenario() -> None:
+        runner, journal, clock = _runner(strategy=_Script([_good_signal()]))
+
+        async def explode(**_kwargs: object):
+            raise RuntimeError("engine down")
+
+        runner.engine.submit_entry = explode  # type: ignore[method-assign]
+
+        async def source():
+            for tick in (_quote(DAY, "100", 10), _quote(DAY + timedelta(minutes=1), "100", 20)):
+                clock["now"] = tick.received_at
+                yield tick
+
+        with pytest.raises(RuntimeError, match="engine down"):
+            await runner.run(source())
+        _assert_fail_closed(runner, journal)
+
+    asyncio.run(scenario())
+
+
+def test_a_feed_error_is_fail_closed() -> None:
+    async def scenario() -> None:
+        runner, journal, clock = _runner(strategy=_Script([]))
+
+        async def source():
+            tick = _quote(DAY, "100", 10)
+            clock["now"] = tick.received_at
+            yield tick
+            raise RuntimeError("feed down")
+
+        with pytest.raises(RuntimeError, match="feed down"):
+            await runner.run(source())
+        _assert_fail_closed(runner, journal)
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_the_runner_is_fail_closed() -> None:
+    async def scenario() -> None:
+        runner, journal, clock = _runner(strategy=_Script([]))
+        started = asyncio.Event()
+
+        async def source():
+            tick = _quote(DAY, "100", 10)
+            clock["now"] = tick.received_at
+            yield tick
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(runner.run(source()))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        _assert_fail_closed(runner, journal)
+
+    asyncio.run(scenario())

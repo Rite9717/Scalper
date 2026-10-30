@@ -96,6 +96,16 @@ class PaperJournal(Protocol):
         quantity: int | None,
     ) -> None: ...
 
+    async def record_run_end(
+        self,
+        *,
+        run_id: UUID,
+        ended_at: datetime,
+        reason: str,
+        final_position: int,
+        kill_engaged: bool,
+    ) -> None: ...
+
     async def read(self, run_id: UUID) -> dict[str, list[dict[str, object]]]: ...
 
 
@@ -107,6 +117,7 @@ class MemoryJournal:
         self.orders: list[dict[str, object]] = []
         self.fills: list[dict[str, object]] = []
         self.exits: list[dict[str, object]] = []
+        self.run_ends: list[dict[str, object]] = []
 
     async def start_run(
         self,
@@ -246,6 +257,25 @@ class MemoryJournal:
             }
         )
 
+    async def record_run_end(
+        self,
+        *,
+        run_id: UUID,
+        ended_at: datetime,
+        reason: str,
+        final_position: int,
+        kill_engaged: bool,
+    ) -> None:
+        self.run_ends.append(
+            {
+                "run_id": str(run_id),
+                "ended_at": ended_at,
+                "reason": reason,
+                "final_position": final_position,
+                "kill_engaged": kill_engaged,
+            }
+        )
+
     async def read(self, run_id: UUID) -> dict[str, list[dict[str, object]]]:
         key = str(run_id)
         return {
@@ -255,6 +285,7 @@ class MemoryJournal:
             "orders": [row for row in self.orders if row["run_id"] == key],
             "fills": [row for row in self.fills if row["run_id"] == key],
             "exits": [row for row in self.exits if row["run_id"] == key],
+            "run_ends": [row for row in self.run_ends if row["run_id"] == key],
         }
 
 
@@ -419,6 +450,27 @@ class PostgresJournal:
             quantity,
         )
 
+    async def record_run_end(
+        self,
+        *,
+        run_id: UUID,
+        ended_at: datetime,
+        reason: str,
+        final_position: int,
+        kill_engaged: bool,
+    ) -> None:
+        await self._connection.execute(
+            """
+            INSERT INTO paper_run_ends (run_id, ended_at, reason, final_position, kill_engaged)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            run_id,
+            ended_at,
+            reason,
+            final_position,
+            kill_engaged,
+        )
+
     async def read(self, run_id: UUID) -> dict[str, list[dict[str, object]]]:
         run_row = await self._connection.fetchrow("SELECT * FROM paper_runs WHERE run_id = $1", run_id)
         runs = []
@@ -442,7 +494,21 @@ class PostgresJournal:
             "orders": await self._rows("paper_orders", run_id),
             "fills": await self._rows("paper_fills", run_id),
             "exits": await self._rows("paper_exits", run_id),
+            "run_ends": await self._run_ends(run_id),
         }
+
+    async def _run_ends(self, run_id: UUID) -> list[dict[str, object]]:
+        fetched = await self._connection.fetch("SELECT * FROM paper_run_ends WHERE run_id = $1", run_id)
+        return [
+            {
+                "run_id": str(row["run_id"]),
+                "ended_at": row["ended_at"],
+                "reason": row["reason"],
+                "final_position": row["final_position"],
+                "kill_engaged": row["kill_engaged"],
+            }
+            for row in fetched
+        ]
 
     async def _rows(self, table: str, run_id: UUID) -> list[dict[str, object]]:
         fetched = await self._connection.fetch(f"SELECT * FROM {table} WHERE run_id = $1 ORDER BY id", run_id)

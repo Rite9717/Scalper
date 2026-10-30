@@ -142,6 +142,9 @@ async def run_paper(settings: Settings, strategy_name: str) -> int:
     feed = _KiteQuotes(bridge, contract.tick_size, contract.instrument_token)
     try:
         await runner.run(feed)
+    except BaseException as exc:
+        await runner.fail_closed(exc)
+        raise
     finally:
         await health.stop()
         await connection.close()

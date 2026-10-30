@@ -19,6 +19,7 @@ from scalper.clock import ensure_ist
 from scalper.data.cache import QuoteCache
 from scalper.data.models import NormalizedQuote
 from scalper.execution.engine import ExecutionEngine, UnmanagedPosition
+from scalper.execution.halt import halt_new_entries
 from scalper.execution.paper import PaperBroker
 from scalper.execution.snapshot import AccountLimits
 from scalper.execution.states import ManagedOrder, OrderStatus
@@ -121,6 +122,7 @@ class PaperRunner:
         self._stop = asyncio.Event()
         self._stall_open = False
         self._reconnect_wait = paper.reconnect_initial_seconds
+        self._fail_closed_done = False
         self._log = structlog.get_logger()
 
     def request_stop(self) -> None:
@@ -135,23 +137,27 @@ class PaperRunner:
             tradingsymbol=self.engine.tradingsymbol,
             limits=self.limits_record,
         )
-        iterator = source.__aiter__()
-        while not self._stop.is_set():
-            item = await self._next(iterator)
-            if item is None:
-                break
-            if isinstance(item, Stop) or self._stop.is_set():
-                break
-            if isinstance(item, Silence):
-                await self._on_silence()
-                continue
-            if isinstance(item, FeedDrop):
-                await self._on_drop()
-                continue
-            if not isinstance(item, NormalizedQuote):
-                raise TypeError("paper feed emitted an unknown event")
-            await self._on_quote(item)
-        await self._shutdown("runner stopped")
+        try:
+            iterator = source.__aiter__()
+            while not self._stop.is_set():
+                item = await self._next(iterator)
+                if item is None:
+                    break
+                if isinstance(item, Stop) or self._stop.is_set():
+                    break
+                if isinstance(item, Silence):
+                    await self._on_silence()
+                    continue
+                if isinstance(item, FeedDrop):
+                    await self._on_drop()
+                    continue
+                if not isinstance(item, NormalizedQuote):
+                    raise TypeError("paper feed emitted an unknown event")
+                await self._on_quote(item)
+            await self._shutdown("runner stopped")
+        except BaseException as exc:
+            await self.fail_closed(exc)
+            raise
 
     async def _next(self, iterator: AsyncIterator[object]) -> object | None:
         if not self._pace:
@@ -428,6 +434,41 @@ class PaperRunner:
     async def _blind_flatten(self) -> None:
         self._log.error("stops_blind_flatten", last_price=None if self.last_price is None else format(self.last_price, "f"))
         await self._shutdown("feed blind with an open position")
+
+    async def fail_closed(self, exc: BaseException) -> None:
+        """Halt, kill, alert, flatten, and record the end. Each step is attempted."""
+        if self._fail_closed_done:
+            return
+        self._fail_closed_done = True
+        task = asyncio.current_task()
+        if isinstance(exc, asyncio.CancelledError) and task is not None:
+            while task.uncancel():
+                pass
+        reason = f"{type(exc).__name__}: {exc}"
+        await self._attempt("halt", lambda: halt_new_entries(reason))
+        await self._attempt("kill", lambda: engage(self.kill_file, reason))
+        await self._attempt("alert", lambda: self.monitor.kill_switch(True, reason))
+        await self._attempt("flatten", lambda: self.engine.shutdown(self.last_price))
+        final_position = self.engine.position_quantity
+        kill_engaged = is_killed(self.kill_file)
+        await self._attempt(
+            "run_end",
+            lambda: self.journal.record_run_end(
+                run_id=self.run_id,
+                ended_at=self._now(),
+                reason=reason,
+                final_position=final_position,
+                kill_engaged=kill_engaged,
+            ),
+        )
+
+    async def _attempt(self, step: str, action: Callable[[], object]) -> None:
+        try:
+            result = action()
+            if isinstance(result, Awaitable):
+                await result
+        except BaseException:
+            self._log.exception("paper_fail_closed_step_failed", step=step)
 
     async def _shutdown(self, reason: str) -> None:
         try:
