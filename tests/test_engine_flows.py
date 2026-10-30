@@ -23,6 +23,7 @@ from scalper.execution.errors import AmbiguousOrderOutcome
 from scalper.execution.halt import entries_halted
 from scalper.risk.killfile import is_killed
 from scalper.execution.states import ManagedOrder, OrderStatus
+from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
 from scalper.monitor.alerts import Monitor, RecordingSink
 from scalper.monitor.metrics import build_metrics
 from scalper.risk.gate import RiskSnapshot
@@ -388,6 +389,75 @@ def test_flatten_reprice_stops_after_twenty_five_steps() -> None:
         assert broker.modify_prices[-1] == Decimal("101") - TICK * 25
 
     asyncio.run(scenario())
+
+
+def test_flatten_replaces_the_order_after_twenty_five_mods_inside_the_tick_limit() -> None:
+    async def scenario(long_position: bool) -> None:
+        broker = FakeBroker()
+        ticks = 40
+        engine, _clock = _engine(
+            broker,
+            flatten_timeout=60.0,
+            flatten_poll_interval=0.5,
+            flatten_max_adverse_ticks=ticks,
+        )
+        placed: list[ManagedOrder] = []
+        mods: list[tuple[str, Decimal]] = []
+        original_place = broker.place_limit
+        original_modify = broker.modify_price
+
+        async def record_place(order: ManagedOrder) -> PlaceOutcome:
+            outcome = await original_place(order)
+            placed.append(outcome.order)
+            return outcome
+
+        async def record_modify(order_id: str, limit_price: Decimal) -> ManagedOrder:
+            mods.append((order_id, limit_price))
+            return await original_modify(order_id, limit_price)
+
+        broker.place_limit = record_place  # type: ignore[method-assign]
+        broker.modify_price = record_modify  # type: ignore[method-assign]
+        if long_position:
+            await _open_long(engine, broker)
+            start = Decimal("101")
+            side = "sell"
+            remaining = LOT
+        else:
+            await _open_short(engine, broker)
+            start = Decimal("99")
+            side = "buy"
+            remaining = -LOT
+        bound = start - TICK * ticks if side == "sell" else start + TICK * ticks
+        try:
+            await engine.shutdown(start)
+        except UnmanagedPosition as exc:
+            text = str(exc)
+        else:
+            raise AssertionError("the replacement flatten was marked flat")
+        flatten_orders = [order for order in placed if order.side == side]
+        assert len(flatten_orders) == 2
+        original, replacement = flatten_orders
+        assert original.tag != replacement.tag
+        assert replacement.broker_order_id is not None
+        assert replacement.broker_order_id in text
+        assert f"remaining {remaining}" in text
+        assert engine.orders[original.tag].status is OrderStatus.CANCELLED
+        by_order: dict[str, list[Decimal]] = {}
+        for order_id, price in mods:
+            by_order.setdefault(order_id, []).append(price)
+        assert original.broker_order_id is not None
+        assert len(by_order[original.broker_order_id]) == KITE_MAX_MODIFICATIONS_PER_ORDER
+        assert len(by_order[replacement.broker_order_id]) <= KITE_MAX_MODIFICATIONS_PER_ORDER
+        assert all(len(prices) <= KITE_MAX_MODIFICATIONS_PER_ORDER for prices in by_order.values())
+        prices = [order.limit_price for order in flatten_orders]
+        prices.extend(price for _order_id, price in mods)
+        if side == "sell":
+            assert all(bound <= price <= start for price in prices)
+        else:
+            assert all(start <= price <= bound for price in prices)
+
+    asyncio.run(scenario(True))
+    asyncio.run(scenario(False))
 
 
 def test_twenty_five_modifications_are_replaced_with_a_new_tag() -> None:
