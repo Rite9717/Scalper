@@ -1425,3 +1425,47 @@ def test_live_mode_does_not_skip_a_missing_broker_pnl_or_exchange_time() -> None
         assert refused.decision.allowed is False
 
     asyncio.run(scenario())
+
+
+def test_order_sequences_restart_for_each_decision_and_flattens_use_real_timestamps() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+        stamps = iter((1_700_000_000_000, 1_700_000_060_000))
+        engine, _clock = _engine(broker, now_ms=lambda: next(stamps))
+        for offset in range(70):
+            placed = await engine.submit_entry(
+                side="buy",
+                limit_price=Decimal("100"),
+                quantity=LOT,
+                stop_price=Decimal("99"),
+                strategy_id="trend",
+                timestamp_ms=3_000_000 + offset,
+            )
+            assert placed.order is not None
+        with pytest.raises(ValueError, match="timestamp_ms"):
+            await engine.submit_exit(
+                side="sell",
+                limit_price=Decimal("101"),
+                quantity=LOT,
+                strategy_id="trend",
+                timestamp_ms=0,
+            )
+        for _ in range(61):
+            engine._replacement_sequence(9_000_000, "flatten")
+        with pytest.raises(ValueError, match="sequence"):
+            engine._replacement_sequence(9_000_000, "flatten")
+        assert engine._replacement_sequence(9_000_001, "flatten") == 1
+
+        fresh = FakeBroker()
+        engine, _clock = _engine(fresh, now_ms=lambda: next(stamps), flatten_timeout=0.4, flatten_poll_interval=0.5)
+        await _open_long(engine, fresh)
+        with pytest.raises(UnmanagedPosition):
+            await engine.shutdown(Decimal("101"))
+        with pytest.raises(UnmanagedPosition):
+            await engine.shutdown(Decimal("101"))
+        tags = [order.tag for order in fresh.orders.values() if order.intent == "flatten"]
+        assert len(tags) == 2
+        assert tags[0] != tags[1]
+        assert all(not tag.startswith("00000000") for tag in tags)
+
+    asyncio.run(scenario())

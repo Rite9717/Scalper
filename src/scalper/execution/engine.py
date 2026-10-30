@@ -73,6 +73,7 @@ class ExecutionEngine:
         flatten_max_adverse_ticks: int,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        now_ms: Callable[[], int] | None = None,
     ) -> None:
         if not tradingsymbol or not exchange:
             raise ValueError("tradingsymbol and exchange are required")
@@ -103,6 +104,7 @@ class ExecutionEngine:
         self.flatten_max_adverse_ticks = flatten_max_adverse_ticks
         self._monotonic = clock or time.monotonic
         self._sleep = sleep or asyncio.sleep
+        self._now_ms = now_ms or (lambda: time.time_ns() // 1_000_000)
         self.orders: dict[str, ManagedOrder] = {}
         self.foreign_orders: list[ManagedOrder] = []
         self.position_quantity = 0
@@ -110,7 +112,7 @@ class ExecutionEngine:
         self._our_tags: set[str] = set()
         self.recent_rejects = 0
         self._reject_ids: set[str] = set()
-        self._replace_sequence = 1
+        self._replacement_at: dict[tuple[int, str], int] = {}
         self._modifications: dict[str, int] = {}
 
     async def submit_entry(
@@ -175,8 +177,7 @@ class ExecutionEngine:
             book = await self.refresh()
             return SubmitResult(self._require_book_order(order_id, book), RiskDecision(True, "allow", "price modified"))
         booked = await self._book_order(order_id)
-        sequence = self._replace_sequence
-        self._replace_sequence += 1
+        sequence = self._replacement_sequence(timestamp_ms, strategy_id)
         return await self._submit(
             intent=Intent(current.intent),
             side=current.side,
@@ -250,13 +251,14 @@ class ExecutionEngine:
         if last_price is None:
             raise UnmanagedPosition(f"remaining {self.position_quantity}; orders none")
         side = _flatten_side(self.position_quantity)
+        stamp = self._now_ms()
         result = await self._submit(
             intent=Intent.FLATTEN,
             side=side,
             limit_price=last_price,
             quantity=abs(self.position_quantity),
             strategy_id="flatten",
-            timestamp_ms=0,
+            timestamp_ms=stamp,
             planned_loss=Decimal("0"),
         )
         if result.order is None or result.order.broker_order_id is None:
@@ -273,10 +275,10 @@ class ExecutionEngine:
             self.flatten_max_adverse_ticks,
             self.tick_size,
         )
-        await self._drive_flatten(result.order.broker_order_id, worst, self._monotonic())
+        await self._drive_flatten(result.order.broker_order_id, worst, self._monotonic(), stamp)
         return ShutdownReport(True, self.position_quantity)
 
-    async def _drive_flatten(self, order_id: str, worst: Decimal, placed_at: float) -> None:
+    async def _drive_flatten(self, order_id: str, worst: Decimal, placed_at: float, timestamp_ms: int) -> None:
         deadline = placed_at + self.flatten_timeout
         # The first reprice waits one full poll after the order is placed.
         last_modify_at = placed_at
@@ -299,15 +301,14 @@ class ExecutionEngine:
                     if self.position_quantity == 0:
                         return
                     raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
-                sequence = self._replace_sequence
-                self._replace_sequence += 1
+                sequence = self._replacement_sequence(timestamp_ms, "flatten")
                 replaced = await self._submit(
                     intent=Intent.FLATTEN,
                     side=order.side,
                     limit_price=nxt,
                     quantity=booked.remaining,
                     strategy_id="flatten",
-                    timestamp_ms=0,
+                    timestamp_ms=timestamp_ms,
                     planned_loss=Decimal("0"),
                     sequence=sequence,
                 )
@@ -336,6 +337,8 @@ class ExecutionEngine:
         planned_loss: Decimal,
         sequence: int | None = None,
     ) -> SubmitResult:
+        if type(timestamp_ms) is not int or timestamp_ms < 1:
+            raise ValueError("timestamp_ms must be a positive millisecond timestamp")
         if sequence is None:
             sequence = 0
         tag = make_order_tag(timestamp_ms=timestamp_ms, strategy_id=strategy_id, sequence=sequence)
@@ -432,6 +435,17 @@ class ExecutionEngine:
             if order.broker_order_id == order_id:
                 return order
         raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
+
+    def _replacement_sequence(self, timestamp_ms: int, strategy_id: str) -> int:
+        """Next replacement tag for one decision. A new timestamp starts again at 1."""
+        if type(timestamp_ms) is not int or timestamp_ms < 1:
+            raise ValueError("timestamp_ms must be a positive millisecond timestamp")
+        key = (timestamp_ms, strategy_id)
+        sequence = self._replacement_at.get(key, 1)
+        if sequence > 61:
+            raise ValueError("sequence must be an int from 0 to 61")
+        self._replacement_at[key] = sequence + 1
+        return sequence
 
     def _same_instrument(self, order: ManagedOrder) -> bool:
         return order.tradingsymbol == self.tradingsymbol and order.exchange == self.exchange
