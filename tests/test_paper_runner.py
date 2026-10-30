@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from scalper.backtest.strategy import EntrySignal, MarketState
+from scalper.strategy.filters import FilterConfig, FilteredStrategy
 from scalper.clock import IST
 from scalper.config import Settings
 from scalper.data.bridge import AsyncTickerBridge
@@ -369,6 +370,40 @@ def test_an_unfilled_stop_is_repriced_then_the_kill_file_is_engaged() -> None:
         with pytest.raises(UnmanagedPosition):
             await runner.run(source())
         assert is_killed(Path("paper-kill")) is True
+
+    asyncio.run(scenario())
+
+
+class _AlwaysBuy:
+    name = "trend_pullback"
+
+    def on_bar(self, _state: MarketState) -> EntrySignal:
+        return _good_signal()
+
+
+def test_loss_streak_and_expiry_day_block_a_paper_entry() -> None:
+    async def scenario() -> None:
+        runner, _journal, clock = _runner(strategy=_AlwaysBuy())  # type: ignore[arg-type]
+        candle = Candle(1, DAY, "minute", Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100.5"), 1, None, "ticks")
+        runner.bars = [candle]
+        runner.strategy = FilteredStrategy(
+            _AlwaysBuy(),
+            FilterConfig(skip_open_minutes=0, skip_close_minutes=0, loss_streak_limit=1, cooldown_bars=5),
+        )
+        runner.loss_streak = 1
+        runner.last_loss_index = 0
+        await runner._on_bar()
+        assert runner.broker.orders == {}
+        assert runner.strategy.blocked == 1
+
+        runner.strategy = FilteredStrategy(_AlwaysBuy(), FilterConfig(skip_open_minutes=0, skip_close_minutes=0))
+        runner.loss_streak = 0
+        runner.last_loss_index = None
+        runner.expiry_dates = {DAY.date()}
+        clock["now"] = datetime(2026, 10, 27, 13, 0, tzinfo=IST)
+        await runner._on_bar()
+        assert runner.broker.orders == {}
+        assert runner.strategy.blocked == 1
 
     asyncio.run(scenario())
 

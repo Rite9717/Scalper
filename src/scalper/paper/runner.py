@@ -7,6 +7,7 @@ import signal
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
@@ -14,6 +15,7 @@ from uuid import UUID
 
 import structlog
 
+from scalper.backtest.costs import ChargeSchedule, round_trip_charges
 from scalper.backtest.strategy import EntrySignal, MarketState, Strategy
 from scalper.clock import ensure_ist
 from scalper.data.cache import QuoteCache
@@ -90,6 +92,8 @@ class PaperRunner:
         tick_size: Decimal,
         limits_record: dict[str, str],
         pace: bool = True,
+        charges: ChargeSchedule | None = None,
+        expiry_dates: set[date] | None = None,
     ) -> None:
         if latency_bars < 1:
             raise ValueError("latency_bars must be at least 1 so the signal bar cannot fill")
@@ -123,6 +127,12 @@ class PaperRunner:
         self._stall_open = False
         self._reconnect_wait = paper.reconnect_initial_seconds
         self._fail_closed_done = False
+        self.charges = charges or ChargeSchedule()
+        self.expiry_dates = set(expiry_dates or ())
+        self.daily_pnl = Decimal("0")
+        self.loss_streak = 0
+        self.last_loss_index: int | None = None
+        self._pnl_day: date | None = None
         self._log = structlog.get_logger()
 
     def request_stop(self) -> None:
@@ -245,11 +255,17 @@ class PaperRunner:
         if is_killed(self.kill_file):
             await self._record_decision(Intent.ENTRY, False, "halt", "kill file is engaged")
             return
+        index = len(self.bars) - 1
+        bars_since = None if self.last_loss_index is None else index - self.last_loss_index
         signal = self.strategy.on_bar(
             MarketState(
                 bars=tuple(self.bars),
                 tick_size=self.tick_size,
                 now=self._now(),
+                daily_pnl=self.daily_pnl,
+                loss_streak=self.loss_streak,
+                bars_since_last_loss=bars_since,
+                expiry_day=self._now().date() in self.expiry_dates,
             )
         )
         if signal is None:
@@ -420,8 +436,38 @@ class PaperRunner:
             fill_price=order.average_price,
             quantity=order.filled_quantity,
         )
+        self._note_closed_trade(order.average_price, len(self.bars) - 1)
         self.position = None
         self.exit = None
+
+    def _note_closed_trade(self, exit_price: Decimal, index: int) -> None:
+        assert self.position is not None
+        if self.position.side == "buy":
+            gross = (exit_price - self.position.fill_price) * self.position.quantity
+        else:
+            gross = (self.position.fill_price - exit_price) * self.position.quantity
+        charges = round_trip_charges(
+            self.charges,
+            entry_price=self.position.fill_price,
+            exit_price=exit_price,
+            quantity=self.position.quantity,
+            entry_side=self.position.side,
+            tick_size=self.tick_size,
+        ).total
+        net = gross - charges
+        day = self._now().date()
+        if self._pnl_day != day:
+            self._pnl_day = day
+            self.daily_pnl = Decimal("0")
+            self.loss_streak = 0
+            self.last_loss_index = None
+        self.daily_pnl += net
+        if net < 0:
+            self.loss_streak += 1
+            self.last_loss_index = index
+            return
+        self.loss_streak = 0
+        self.last_loss_index = None
 
     async def _note_stall(self, age: timedelta) -> None:
         seconds = age.total_seconds()

@@ -26,7 +26,8 @@ from scalper.execution.engine import ExecutionEngine
 from scalper.execution.paper import PaperBroker
 from scalper.execution.snapshot import LiveSnapshotProvider
 from scalper.health import HealthServer
-from scalper.kite.instruments import parse_instruments, select_current_nifty_future
+from scalper.backtest.costs import ChargeSchedule
+from scalper.kite.instruments import is_nifty_future, parse_instruments, select_current_nifty_future
 from scalper.kite.session import load_session
 from scalper.monitor.alerts import Monitor, RecordingSink, TelegramSink
 from scalper.monitor.metrics import build_metrics
@@ -68,7 +69,9 @@ async def run_paper(settings: Settings, strategy_name: str) -> int:
         database_ping=ping,
     )
     print(json.dumps(record, sort_keys=True))
-    contract = select_current_nifty_future(parse_instruments(master.read_text(encoding="utf-8")), day)
+    instruments = parse_instruments(master.read_text(encoding="utf-8"))
+    contract = select_current_nifty_future(instruments, day)
+    expiries = {row.expiry for row in instruments if is_nifty_future(row) and row.expiry is not None}
     await apply_migrations(settings.database_url.get_secret_value())
     connection = await asyncpg.connect(settings.database_url.get_secret_value(), timeout=5)
     session = load_session(settings.session_path)
@@ -127,6 +130,17 @@ async def run_paper(settings: Settings, strategy_name: str) -> int:
         latency_bars=settings.latency_bars,
         tick_size=contract.tick_size,
         limits_record=record,
+        charges=ChargeSchedule(
+            brokerage_rate=settings.brokerage_rate,
+            brokerage_cap=settings.brokerage_cap,
+            stt_sell_rate=settings.stt_sell_rate,
+            exchange_rate=settings.exchange_rate,
+            sebi_rate=settings.sebi_rate,
+            stamp_buy_rate=settings.stamp_buy_rate,
+            gst_rate=settings.gst_rate,
+            spread_ticks=settings.spread_ticks,
+        ),
+        expiry_dates=expiries,
     )
     health = HealthServer(settings, metrics=metrics)
     await health.start()
