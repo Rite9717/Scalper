@@ -16,6 +16,7 @@ from typing import Protocol
 
 from scalper.backtest.costs import ChargeSchedule, side_charges
 from scalper.clock import IST, now_ist
+from scalper.compliance import LIVE_INITIAL_MAX_LOTS
 from scalper.data.cache import QuoteCache
 from scalper.execution.broker import Broker
 from scalper.execution.states import ManagedOrder
@@ -121,7 +122,8 @@ class LiveSnapshotProvider:
         self.exchange = exchange
         self.kill_file = kill_file
         self.live = live
-        self.limits = limits or AccountLimits()
+        self.limits = limits or AccountLimits(trading_mode="live" if live else "paper")
+        _require_live_mode(self.live, self.limits)
         self._now = now or now_ist
         self.schedule = schedule or ChargeSchedule()
         self.tick_size = tick_size
@@ -252,6 +254,15 @@ class LiveSnapshotProvider:
     def _since(self, events: list[datetime], now: datetime, window: timedelta) -> int:
         cutoff = now - window
         return sum(1 for moment in events if moment >= cutoff)
+
+
+def _require_live_mode(live: bool, limits: AccountLimits) -> None:
+    if live and limits.trading_mode != "live":
+        raise ValueError("live snapshots require trading_mode live")
+    if live and limits.max_lots > LIVE_INITIAL_MAX_LOTS:
+        raise ValueError("live snapshots are capped at most one lot")
+    if not live and limits.trading_mode == "live":
+        raise ValueError("a backtest snapshot cannot use trading_mode live")
 
 
 def _parse_time(value: object) -> datetime | None:

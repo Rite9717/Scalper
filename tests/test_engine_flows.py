@@ -694,7 +694,7 @@ def _live_engine(
         kill_file=kill_file or Path("quote-kill"),
         live=live,
         now=lambda: NOW,
-        limits=AccountLimits(),
+        limits=AccountLimits(trading_mode="live" if live else "paper"),
         tick_size=TICK,
     )
     return ExecutionEngine(
@@ -978,6 +978,27 @@ def test_gross_pnl_matches_the_broker_after_charges_and_a_real_price_discrepancy
         assert mismatch.decision.reason == "pnl mismatch versus broker"
 
     asyncio.run(scenario())
+
+
+def test_live_flag_must_agree_with_trading_mode_and_the_lot_cap() -> None:
+    broker = FakeBroker()
+    cache = MemoryQuoteCache()
+    common = {
+        "broker": broker,
+        "cache": cache,
+        "instrument_token": 1,
+        "tradingsymbol": SYMBOL,
+        "exchange": EXCHANGE,
+        "kill_file": Path("mode-kill"),
+    }
+    with pytest.raises(ValueError, match="trading_mode live"):
+        LiveSnapshotProvider(**common, live=True, limits=AccountLimits(trading_mode="paper"))
+    with pytest.raises(ValueError, match="capped at most one lot"):
+        LiveSnapshotProvider(**common, live=True, limits=AccountLimits(trading_mode="live", max_lots=2))
+    with pytest.raises(ValueError, match="cannot use trading_mode live"):
+        LiveSnapshotProvider(**common, live=False, limits=AccountLimits(trading_mode="live"))
+    LiveSnapshotProvider(**common, live=True, limits=AccountLimits(trading_mode="live", max_lots=1))
+    LiveSnapshotProvider(**common, live=False, limits=AccountLimits(trading_mode="paper"))
 
 
 def test_live_mode_does_not_skip_a_missing_broker_pnl_or_exchange_time() -> None:
