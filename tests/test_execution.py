@@ -16,6 +16,7 @@ from scalper.execution.engine import ExecutionEngine, UnmanagedPosition
 from scalper.execution.halt import halt_new_entries
 from scalper.execution.kite_broker import KiteBroker
 from scalper.execution.paper import PaperBroker
+from scalper.execution.snapshot import FixedSnapshotProvider
 from scalper.execution.states import IllegalTransition, ManagedOrder, OrderStatus, fill
 from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
 from scalper.monitor.alerts import Monitor, RecordingSink
@@ -81,7 +82,7 @@ def _engine(
 ) -> ExecutionEngine:
     return ExecutionEngine(
         broker or PaperBroker(TICK, LOT, tradingsymbol=SYMBOL),
-        snapshot or _snapshot(),
+        FixedSnapshotProvider(snapshot or _snapshot()),
         tradingsymbol=SYMBOL,
         exchange=EXCHANGE,
         lot_size=LOT,
@@ -306,7 +307,6 @@ def test_the_engine_refuses_entries_while_the_memory_halt_is_set() -> None:
         assert refused.order is None
         assert refused.decision.allowed is False
         assert refused.decision.action == "halt"
-        assert engine.snapshot.killed is False
         assert engine.broker.orders == {}
 
     asyncio.run(scenario())

@@ -127,6 +127,7 @@ def _position_list(rows: Any, book: str) -> tuple[BrokerPosition, ...]:
                 quantity=_int(row, "quantity"),
                 average_price=_decimal(row, "average_price"),
                 overnight_quantity=_int(row, "overnight_quantity"),
+                pnl=_optional_decimal(row, "pnl"),
             )
         )
     return tuple(mapped)
@@ -161,6 +162,12 @@ def _int(row: dict[str, Any], field: str) -> int:
     if type(value) is bool or not isinstance(value, int):
         raise OrderMappingError(f"{field} is not an integer")
     return value
+
+
+def _optional_decimal(row: dict[str, Any], field: str) -> Decimal | None:
+    if field not in row or row[field] is None:
+        return None
+    return _decimal(row, field)
 
 
 def _decimal(row: dict[str, Any], field: str) -> Decimal:

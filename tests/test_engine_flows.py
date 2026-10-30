@@ -22,6 +22,7 @@ from scalper.execution.engine import ExecutionEngine, PositionMismatch, Unmanage
 from scalper.execution.errors import AmbiguousOrderOutcome
 from scalper.execution.halt import entries_halted
 from scalper.risk.killfile import is_killed
+from scalper.execution.snapshot import FixedSnapshotProvider
 from scalper.execution.states import ManagedOrder, OrderStatus
 from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
 from scalper.monitor.alerts import Monitor, RecordingSink
@@ -170,7 +171,7 @@ def _engine(broker: FakeBroker, **kwargs: object) -> tuple[ExecutionEngine, Fake
         "sleep": clock.sleep,
     }
     values.update(kwargs)
-    engine = ExecutionEngine(broker, _snapshot(), **values)  # type: ignore[arg-type]
+    engine = ExecutionEngine(broker, FixedSnapshotProvider(_snapshot()), **values)  # type: ignore[arg-type]
     return engine, clock
 
 

@@ -9,13 +9,16 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from datetime import time as clock_time
 from decimal import Decimal
 from pathlib import Path
 
 from scalper.execution.broker import Broker
 from scalper.execution.errors import AmbiguousOrderOutcome
 from scalper.execution.halt import entries_halted, entry_halt_reason, halt_new_entries
+from scalper.execution.snapshot import SnapshotProvider
 from scalper.execution.states import TERMINAL, IllegalTransition, ManagedOrder, OrderStatus
 from scalper.execution.submit import (
     _BOOK_CONFIRM_READS,
@@ -26,6 +29,7 @@ from scalper.execution.submit import (
 from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
 from scalper.kite.tags import make_order_tag
 from scalper.monitor.alerts import Monitor
+from scalper.clock import IST
 from scalper.risk.gate import Intent, RiskDecision, RiskSnapshot, assess
 
 
@@ -56,7 +60,7 @@ class ExecutionEngine:
     def __init__(
         self,
         broker: Broker,
-        snapshot: RiskSnapshot,
+        provider: SnapshotProvider,
         *,
         tradingsymbol: str,
         exchange: str,
@@ -87,7 +91,7 @@ class ExecutionEngine:
         if type(flatten_max_adverse_ticks) is not int or flatten_max_adverse_ticks < 1:
             raise ValueError("flatten max adverse ticks must be a positive integer")
         self.broker = broker
-        self.snapshot = snapshot
+        self.provider = provider
         self.tradingsymbol = tradingsymbol
         self.exchange = exchange
         self.lot_size = lot_size
@@ -104,7 +108,7 @@ class ExecutionEngine:
         self.position_quantity = 0
         self.unmanaged: list[str] = []
         self._our_tags: set[str] = set()
-        self.recent_rejects = snapshot.recent_rejects
+        self.recent_rejects = 0
         self._reject_ids: set[str] = set()
         self._replace_sequence = 1
         self._modifications: dict[str, int] = {}
@@ -346,19 +350,22 @@ class ExecutionEngine:
             return SubmitResult(existing, RiskDecision(True, "allow", "duplicate tag"))
         lots = max(1, quantity // self.lot_size)
         open_lots = abs(self.position_quantity) // self.lot_size
-        decision = assess(
-            intent,
-            replace(
-                self.snapshot,
+        try:
+            snapshot = await self.provider.build(
                 lots_requested=lots,
                 open_lots=open_lots,
                 planned_loss=planned_loss,
-                recent_rejects=self.recent_rejects,
-            ),
-        )
+                orders=list(self.orders.values()),
+            )
+        except Exception:
+            if intent is Intent.ENTRY:
+                return SubmitResult(None, RiskDecision(False, "halt", "risk snapshot unavailable"))
+            snapshot = _protective_snapshot(lots_requested=lots, open_lots=open_lots, planned_loss=planned_loss)
+        decision = assess(intent, snapshot)
         if not decision.allowed:
             return SubmitResult(None, decision)
         self._our_tags.add(tag)
+        self.provider.note_order()
         try:
             await place_live_limit(
                 self.broker,
@@ -430,7 +437,7 @@ class ExecutionEngine:
             return
         self._reject_ids.add(order.broker_order_id)
         self.recent_rejects += 1
-        self.snapshot = replace(self.snapshot, recent_rejects=self.recent_rejects)
+        self.provider.note_reject()
 
     def _raise_for_foreign(self) -> None:
         if not self.foreign_orders:
@@ -452,6 +459,39 @@ class ExecutionEngine:
         )
         halt_new_entries(reason)
         raise PositionMismatch(reason)
+
+
+def _protective_snapshot(*, lots_requested: int, open_lots: int, planned_loss: Decimal) -> RiskSnapshot:
+    """Used when the provider fails during an exit or flatten, so the close can still be sent."""
+    now = datetime.now(IST)
+    return RiskSnapshot(
+        now=now,
+        trading_mode="paper",
+        lots_requested=lots_requested,
+        open_lots=open_lots,
+        max_lots=1,
+        planned_loss=planned_loss,
+        max_loss_per_trade=Decimal("1000000"),
+        daily_pnl=Decimal("0"),
+        daily_loss_limit=Decimal("1000000"),
+        orders_last_second=0,
+        orders_last_minute=0,
+        max_orders_per_second=100,
+        max_orders_per_minute=10000,
+        last_quote_at=now,
+        stale_after=timedelta(hours=1),
+        available_margin=Decimal("1"),
+        required_margin=Decimal("0"),
+        flatten_time=clock_time(23, 59),
+        broker_pnl=None,
+        internal_pnl=None,
+        pnl_tolerance=Decimal("1"),
+        exchange_time=None,
+        clock_drift_limit=timedelta(hours=1),
+        recent_rejects=0,
+        max_rejects=100,
+        killed=False,
+    )
 
 
 def _net_filled(book: list[ManagedOrder]) -> int:

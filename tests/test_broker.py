@@ -32,6 +32,7 @@ from scalper.execution.kite_broker import (
     KiteBroker,
 )
 from scalper.execution.paper import PaperBroker
+from scalper.execution.snapshot import FixedSnapshotProvider
 from scalper.execution.states import IllegalTransition, ManagedOrder, OrderStatus
 from scalper.execution.submit import engage
 from scalper.execution.submit import place_live_limit
@@ -654,7 +655,7 @@ def test_a_failed_kill_file_still_blocks_the_next_entry(tmp_path) -> None:
     async def scenario() -> None:
         engine = ExecutionEngine(
             PaperBroker(TICK, LOT, tradingsymbol="NIFTY26OCTFUT"),
-            _entry_snapshot(),
+            FixedSnapshotProvider(_entry_snapshot()),
             tradingsymbol="NIFTY26OCTFUT",
             exchange="NFO",
             lot_size=LOT,
@@ -674,7 +675,6 @@ def test_a_failed_kill_file_still_blocks_the_next_entry(tmp_path) -> None:
             timestamp_ms=1_000,
         )
         assert first.order is not None
-        assert engine.snapshot.killed is False
         with pytest.raises(AmbiguousOrderOutcome):
             await _place_ambiguous(directory / "KILL", monitor)
         assert not is_killed(directory / "KILL")
