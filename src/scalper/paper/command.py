@@ -15,7 +15,7 @@ import asyncpg
 
 from scalper.clock import now_ist, today_ist
 from scalper.config import Settings
-from scalper.data.bridge import AsyncTickerBridge
+from scalper.data.bridge import AsyncTickerBridge, BridgeSignal
 from scalper.data.cache import MemoryQuoteCache
 from scalper.data.candles import MinuteBook
 from scalper.data.migrate import apply_migrations
@@ -182,16 +182,10 @@ class _KiteQuotes:
         return self
 
     async def __anext__(self) -> NormalizedQuote | object:
-        if self._bridge.closed.is_set() and self._bridge.queue.empty():
-            self._bridge.closed.clear()
-            from scalper.paper.runner import FeedDrop
+        from scalper.paper.runner import FeedDrop
 
-            return FeedDrop()
         raw = await self._bridge.queue.get()
-        if self._bridge.closed.is_set():
-            self._bridge.closed.clear()
-            from scalper.paper.runner import FeedDrop
-
+        if isinstance(raw, BridgeSignal):
             return FeedDrop()
         if not isinstance(raw, dict):
             return await self.__anext__()

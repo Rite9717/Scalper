@@ -13,9 +13,10 @@ import pytest
 from scalper.backtest.strategy import EntrySignal, MarketState
 from scalper.clock import IST
 from scalper.config import Settings
+from scalper.data.bridge import AsyncTickerBridge
 from scalper.data.cache import MemoryQuoteCache
 from scalper.data.candles import MinuteBook
-from scalper.data.models import NormalizedQuote
+from scalper.data.models import Candle, NormalizedQuote
 from scalper.execution.engine import ExecutionEngine, UnmanagedPosition
 from scalper.execution.halt import entries_halted
 from scalper.execution.kite_broker import KiteBroker
@@ -26,6 +27,7 @@ from scalper.kite.session import KiteSession, save_session
 from scalper.monitor.alerts import Monitor, RecordingSink
 from scalper.monitor.metrics import build_metrics
 from scalper.paper.bars import SessionMinuteBook
+from scalper.paper.command import _KiteQuotes
 from scalper.paper.journal import MemoryJournal
 from scalper.paper.limits import PaperLimits, account_limits, resolved_limits
 from scalper.paper.runner import FeedDrop, PaperRunner, Silence, Stop, install_stop_signals
@@ -367,6 +369,34 @@ def test_an_unfilled_stop_is_repriced_then_the_kill_file_is_engaged() -> None:
         with pytest.raises(UnmanagedPosition):
             await runner.run(source())
         assert is_killed(Path("paper-kill")) is True
+
+    asyncio.run(scenario())
+
+
+def test_a_ticker_disconnect_reaches_the_runner_and_blocks_entries() -> None:
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        bridge = AsyncTickerBridge(loop, asyncio.Queue())
+        bridge.on_close(None, 1000, "dropped")
+        await asyncio.sleep(0)
+        drop = await _KiteQuotes(bridge, TICK, 1).__anext__()
+        assert isinstance(drop, FeedDrop)
+        runner, journal, clock = _runner(strategy=_Script([_good_signal()]))
+        runner.bars = [
+            Candle(1, DAY, "minute", Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100"), 1, None, "ticks")
+        ]
+
+        async def source():
+            yield drop
+            yield Stop()
+
+        await runner.run(source())
+        assert runner.gap is True
+        clock["now"] = DAY + timedelta(minutes=1)
+        await runner._on_bar()
+        view = await journal.read(runner.run_id)
+        assert any(row["reason"] == "feed gap" for row in view["decisions"])
+        assert runner.broker.orders == {}
 
     asyncio.run(scenario())
 

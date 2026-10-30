@@ -11,12 +11,20 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 
+class BridgeSignal:
+    """A websocket lifecycle event, queued beside ticks."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+
+
 @dataclass
 class AsyncTickerBridge:
     loop: asyncio.AbstractEventLoop
     queue: asyncio.Queue
     dropped: int = 0
     received: int = 0
+    connected_once: bool = False
     closed: asyncio.Event = field(init=False)
     last_error: str | None = None
 
@@ -43,9 +51,19 @@ class AsyncTickerBridge:
             except asyncio.QueueFull:
                 self.dropped += 1
 
+    def note_reconnect(self) -> None:
+        self.loop.call_soon_threadsafe(self._enqueue, BridgeSignal("reconnect"))
+
     def _mark_closed(self, text: str) -> None:
         self.last_error = text
         self.closed.set()
+        self._enqueue(BridgeSignal("disconnect"))
 
     def _mark_error(self, text: str) -> None:
         self.last_error = text
+
+    def _enqueue(self, item: object) -> None:
+        try:
+            self.queue.put_nowait(item)
+        except asyncio.QueueFull:
+            self.dropped += 1

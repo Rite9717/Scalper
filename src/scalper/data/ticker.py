@@ -30,6 +30,15 @@ def arm_full_mode(ws: _TickerSocket, instrument_token: int) -> None:
     ws.set_mode(mode, [token])
 
 
+def handle_ticker_connect(ws: _TickerSocket, _response: object, *, bridge: AsyncTickerBridge, instrument_token: int) -> None:
+    """Arm full mode. Every connect after the first is a reconnect gap."""
+    arm_full_mode(ws, instrument_token)
+    if bridge.connected_once:
+        bridge.note_reconnect()
+        return
+    bridge.connected_once = True
+
+
 def connect_kite_ticker(
     *,
     api_key: str,
@@ -42,8 +51,8 @@ def connect_kite_ticker(
 
     ticker = KiteTicker(api_key, access_token)
 
-    def on_connect(ws: _TickerSocket, _response: object) -> None:
-        arm_full_mode(ws, instrument_token)
+    def on_connect(ws: _TickerSocket, response: object) -> None:
+        handle_ticker_connect(ws, response, bridge=bridge, instrument_token=instrument_token)
 
     ticker.on_ticks = bridge.on_ticks
     ticker.on_connect = on_connect
