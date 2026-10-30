@@ -7,38 +7,33 @@ from __future__ import annotations
 
 import asyncio
 import json
-from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
 import asyncpg
 
+import httpx
+
 from scalper.clock import now_ist, today_ist
 from scalper.config import Settings
 from scalper.data.bridge import AsyncTickerBridge, BridgeSignal
-from scalper.data.cache import MemoryQuoteCache
-from scalper.data.candles import MinuteBook
 from scalper.data.migrate import apply_migrations
 from scalper.data.models import NormalizedQuote
 from scalper.data.normalize import QuoteRejected, normalize_full_tick
 from scalper.data.ticker import close_ticker, connect_kite_ticker
-from scalper.execution.engine import ExecutionEngine
-from scalper.execution.paper import PaperBroker
-from scalper.execution.snapshot import LiveSnapshotProvider
 from scalper.health import HealthServer
-from scalper.backtest.costs import ChargeSchedule
 from scalper.kite.instruments import is_nifty_future, parse_instruments, select_current_nifty_future
 from scalper.kite.session import load_session
 from scalper.monitor.alerts import Monitor, RecordingSink, TelegramSink
 from scalper.monitor.metrics import build_metrics
-from scalper.paper.bars import SessionMinuteBook
-from scalper.paper.limits import PaperLimits, account_limits, resolved_limits
 from scalper.paper.journal import PostgresJournal
+from scalper.paper.limits import PaperLimits, resolved_limits
+from scalper.paper.replay import replay_recorded_day
 from scalper.paper.runner import PaperRunner, install_stop_signals
+from scalper.paper.session import build_paper_runner
 from scalper.paper.startup import refuse_to_start
 from scalper.risk.killfile import kill_path
 from scalper.strategy.registry import build_strategy
-import httpx
 
 
 def instrument_master_path(settings: Settings, day) -> Path:
@@ -76,72 +71,20 @@ async def run_paper(settings: Settings, strategy_name: str) -> int:
     connection = await asyncpg.connect(settings.database_url.get_secret_value(), timeout=5)
     session = load_session(settings.session_path)
     metrics = build_metrics()
-    sink = _sink(settings)
-    monitor = Monitor(metrics, sink)
-    broker = PaperBroker(
-        contract.tick_size,
-        contract.lot_size,
-        tradingsymbol=contract.tradingsymbol,
-        equity_cash=Decimal("1000000"),
-    )
-    cache = MemoryQuoteCache()
-    provider = LiveSnapshotProvider(
-        broker=broker,
-        cache=cache,
-        instrument_token=contract.instrument_token,
-        tradingsymbol=contract.tradingsymbol,
-        exchange=contract.exchange,
-        kill_file=killed,
-        live=False,
-        fail_closed=True,
-        limits=account_limits(settings, paper),
-        schedule=None,
-        tick_size=contract.tick_size,
-    )
-    engine = ExecutionEngine(
-        broker,
-        provider,
-        tradingsymbol=contract.tradingsymbol,
-        exchange=contract.exchange,
-        lot_size=contract.lot_size,
-        tick_size=contract.tick_size,
-        kill_file=killed,
-        monitor=monitor,
-        flatten_timeout=paper.flatten_timeout,
-        flatten_poll_interval=paper.flatten_poll_interval,
-        flatten_max_adverse_ticks=paper.flatten_max_adverse_ticks,
-    )
-    runner = PaperRunner(
-        engine=engine,
-        broker=broker,
-        cache=cache,
-        book=SessionMinuteBook(MinuteBook(contract.instrument_token)),
+    monitor = Monitor(metrics, _sink(settings))
+    runner = build_paper_runner(
+        settings=settings,
         strategy=build_strategy(strategy_name),
+        contract=contract,
         journal=PostgresJournal(connection),
         run_id=uuid4(),
         monitor=monitor,
         kill_file=killed,
-        account=account_limits(settings, paper),
-        paper=paper,
         now=now_ist,
         sleep=asyncio.sleep,
-        instrument_token=contract.instrument_token,
-        quantity=contract.lot_size * settings.paper_max_lots,
-        latency_bars=settings.latency_bars,
-        tick_size=contract.tick_size,
-        slippage_ticks=settings.slippage_ticks,
-        limits_record=record,
-        charges=ChargeSchedule(
-            brokerage_rate=settings.brokerage_rate,
-            brokerage_cap=settings.brokerage_cap,
-            stt_sell_rate=settings.stt_sell_rate,
-            exchange_rate=settings.exchange_rate,
-            sebi_rate=settings.sebi_rate,
-            stamp_buy_rate=settings.stamp_buy_rate,
-            gst_rate=settings.gst_rate,
-            spread_ticks=settings.spread_ticks,
-        ),
+        pace=True,
         expiry_dates=expiries,
+        paper=paper,
     )
     health = HealthServer(settings, metrics=metrics)
     await health.start()
