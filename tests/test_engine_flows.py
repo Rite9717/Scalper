@@ -712,6 +712,32 @@ def _live_engine(
     )
 
 
+async def _exit_and_flatten_reach_the_broker(engine: ExecutionEngine, broker: FakeBroker, stamp: int) -> None:
+    before = set(broker.orders)
+    closed = await engine.submit_exit(
+        side="sell",
+        limit_price=Decimal("101"),
+        quantity=LOT,
+        strategy_id="trend",
+        timestamp_ms=stamp,
+    )
+    flattened = await engine._submit(
+        intent=Intent.FLATTEN,
+        side="sell",
+        limit_price=Decimal("101"),
+        quantity=LOT,
+        strategy_id="flatten",
+        timestamp_ms=stamp + 1,
+        planned_loss=Decimal("0"),
+    )
+    assert closed.decision.allowed is True and closed.order is not None
+    assert flattened.decision.allowed is True and flattened.order is not None
+    assert closed.order.broker_order_id not in before
+    assert flattened.order.broker_order_id not in before
+    assert closed.order.broker_order_id in broker.orders
+    assert flattened.order.broker_order_id in broker.orders
+
+
 async def _prove_refused(engine: ExecutionEngine, broker: FakeBroker, reason: str, stamp: int) -> None:
     before = len(broker.orders)
     refused = await engine.submit_entry(
@@ -726,56 +752,55 @@ async def _prove_refused(engine: ExecutionEngine, broker: FakeBroker, reason: st
     assert refused.decision.allowed is False
     assert refused.decision.reason == reason
     assert len(broker.orders) == before
-    closed = await engine.submit_exit(
-        side="sell",
-        limit_price=Decimal("101"),
-        quantity=LOT,
-        strategy_id="trend",
-        timestamp_ms=stamp + 1,
-    )
-    flattened = await engine._submit(
-        intent=Intent.FLATTEN,
-        side="sell",
-        limit_price=Decimal("101"),
-        quantity=LOT,
-        strategy_id="flatten",
-        timestamp_ms=stamp + 2,
-        planned_loss=Decimal("0"),
-    )
-    assert closed.decision.allowed is True and closed.order is not None
-    assert flattened.decision.allowed is True and flattened.order is not None
+    await _exit_and_flatten_reach_the_broker(engine, broker, stamp + 1)
 
 
-def test_live_feed_stall_kill_drift_pnl_rejects_and_margin_block_entries() -> None:
+async def _with_margins(broker: FakeBroker) -> None:
+    async def margins():
+        return _healthy_margins()
+
+    broker.get_margins = margins  # type: ignore[method-assign]
+
+
+def test_feed_stall_blocks_the_entry_and_still_sends_the_exit_and_flatten() -> None:
     async def scenario() -> None:
-        async def healthy(broker: FakeBroker) -> None:
-            async def margins():
-                return _healthy_margins()
-
-            broker.get_margins = margins  # type: ignore[method-assign]
-
         broker = FakeBroker()
-        await healthy(broker)
+        await _with_margins(broker)
         cache = MemoryQuoteCache()
         cache.values[1] = _cached_quote(NOW - timedelta(seconds=6), NOW)
         await _prove_refused(_live_engine(broker, cache), broker, "feed stall", 30_000)
 
+    asyncio.run(scenario())
+
+
+def test_manual_kill_blocks_the_entry_and_still_sends_the_exit_and_flatten() -> None:
+    async def scenario() -> None:
         broker = FakeBroker()
-        await healthy(broker)
+        await _with_margins(broker)
         cache = MemoryQuoteCache()
         cache.values[1] = _cached_quote(NOW, NOW)
         kill = Path("session-kill")
         kill.write_text("stop\n", encoding="utf-8")
         await _prove_refused(_live_engine(broker, cache, kill_file=kill), broker, "manual kill", 31_000)
 
+    asyncio.run(scenario())
+
+
+def test_clock_drift_blocks_the_entry_and_still_sends_the_exit_and_flatten() -> None:
+    async def scenario() -> None:
         broker = FakeBroker()
-        await healthy(broker)
+        await _with_margins(broker)
         cache = MemoryQuoteCache()
         cache.values[1] = _cached_quote(NOW, NOW - timedelta(seconds=10))
         await _prove_refused(_live_engine(broker, cache), broker, "clock drift", 32_000)
 
+    asyncio.run(scenario())
+
+
+def test_pnl_mismatch_blocks_the_entry_and_still_sends_the_exit_and_flatten() -> None:
+    async def scenario() -> None:
         broker = FakeBroker()
-        await healthy(broker)
+        await _with_margins(broker)
         cache = MemoryQuoteCache()
         cache.values[1] = _cached_quote(NOW, NOW)
 
@@ -788,9 +813,14 @@ def test_live_feed_stall_kill_drift_pnl_rejects_and_margin_block_entries() -> No
         broker.get_positions = rich_pnl  # type: ignore[method-assign]
         await _prove_refused(_live_engine(broker, cache), broker, "pnl mismatch versus broker", 33_000)
 
+    asyncio.run(scenario())
+
+
+def test_repeated_rejects_block_the_entry_and_still_send_the_exit_and_flatten() -> None:
+    async def scenario() -> None:
         broker = FakeBroker()
         broker.reject_on_book = True
-        await healthy(broker)
+        await _with_margins(broker)
         cache = MemoryQuoteCache()
         cache.values[1] = _cached_quote(NOW, NOW)
         engine = _live_engine(broker, cache)
@@ -806,6 +836,7 @@ def test_live_feed_stall_kill_drift_pnl_rejects_and_margin_block_entries() -> No
             assert result.decision.allowed is True
             assert result.order is not None
             assert result.order.status is OrderStatus.REJECTED
+            assert result.order.broker_order_id in broker.orders
         refused = await engine.submit_entry(
             side="buy",
             limit_price=Decimal("100"),
@@ -816,15 +847,13 @@ def test_live_feed_stall_kill_drift_pnl_rejects_and_margin_block_entries() -> No
         )
         assert refused.order is None
         assert refused.decision.reason == "repeated order rejects"
-        closed = await engine.submit_exit(
-            side="sell",
-            limit_price=Decimal("101"),
-            quantity=LOT,
-            strategy_id="trend",
-            timestamp_ms=38_000,
-        )
-        assert closed.decision.allowed is True and closed.order is not None
+        await _exit_and_flatten_reach_the_broker(engine, broker, 38_000)
 
+    asyncio.run(scenario())
+
+
+def test_unknown_margin_blocks_the_entry_and_still_sends_the_exit_and_flatten() -> None:
+    async def scenario() -> None:
         broker = FakeBroker()
         cache = MemoryQuoteCache()
         cache.values[1] = _cached_quote(NOW, NOW)
@@ -835,6 +864,11 @@ def test_live_feed_stall_kill_drift_pnl_rejects_and_margin_block_entries() -> No
         broker.get_margins = broken_margins  # type: ignore[method-assign]
         await _prove_refused(_live_engine(broker, cache), broker, "margin unknown", 39_000)
 
+    asyncio.run(scenario())
+
+
+def test_insufficient_margin_blocks_the_entry_and_still_sends_the_exit_and_flatten() -> None:
+    async def scenario() -> None:
         broker = FakeBroker()
         cache = MemoryQuoteCache()
         cache.values[1] = _cached_quote(NOW, NOW)
@@ -848,6 +882,11 @@ def test_live_feed_stall_kill_drift_pnl_rejects_and_margin_block_entries() -> No
         broker.get_margins = tight_margins  # type: ignore[method-assign]
         await _prove_refused(_live_engine(broker, cache), broker, "insufficient margin", 40_000)
 
+    asyncio.run(scenario())
+
+
+def test_unavailable_snapshot_blocks_the_entry_and_still_sends_the_exit_and_flatten() -> None:
+    async def scenario() -> None:
         broker = FakeBroker()
         engine = ExecutionEngine(
             broker,
