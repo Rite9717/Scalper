@@ -11,6 +11,7 @@ from pathlib import Path
 from prometheus_client import CollectorRegistry
 
 from scalper.clock import IST
+from scalper.data.cache import MemoryQuoteCache
 from scalper.execution.broker import (
     BrokerMargins,
     BrokerPosition,
@@ -22,12 +23,12 @@ from scalper.execution.engine import ExecutionEngine, PositionMismatch, Unmanage
 from scalper.execution.errors import AmbiguousOrderOutcome
 from scalper.execution.halt import entries_halted
 from scalper.risk.killfile import is_killed
-from scalper.execution.snapshot import FixedSnapshotProvider
+from scalper.execution.snapshot import AccountLimits, FixedSnapshotProvider, LiveSnapshotProvider
 from scalper.execution.states import ManagedOrder, OrderStatus
 from scalper.kite.api_facts import KITE_MAX_MODIFICATIONS_PER_ORDER
 from scalper.monitor.alerts import Monitor, RecordingSink
 from scalper.monitor.metrics import build_metrics
-from scalper.risk.gate import RiskSnapshot
+from scalper.risk.gate import Intent, RiskSnapshot
 
 TICK = Decimal("0.05")
 LOT = 15
@@ -644,6 +645,286 @@ def test_a_position_mismatch_halts_new_entries() -> None:
             stop_price=Decimal("99"),
             strategy_id="trend",
             timestamp_ms=9_000,
+        )
+        assert refused.order is None
+        assert refused.decision.allowed is False
+
+    asyncio.run(scenario())
+
+
+class _RaisingProvider:
+    def note_order(self) -> None:
+        return None
+
+    def note_reject(self) -> None:
+        return None
+
+    async def build(self, **_kwargs: object) -> object:
+        raise RuntimeError("quote cache unavailable")
+
+
+def _healthy_margins() -> BrokerMargins:
+    return BrokerMargins(
+        MarginSegment(True, Decimal("20000"), Decimal("100000"), Decimal("100000")),
+        MarginSegment(False, Decimal("0"), Decimal("0"), Decimal("0")),
+    )
+
+
+def _cached_quote(received: datetime, exchange: datetime | None) -> dict[str, object]:
+    return {
+        "received_at": received.isoformat(),
+        "exchange_ts": None if exchange is None else exchange.isoformat(),
+        "last_price": "100",
+    }
+
+
+def _live_engine(
+    broker: FakeBroker,
+    cache: MemoryQuoteCache,
+    *,
+    live: bool = True,
+    kill_file: Path | None = None,
+) -> ExecutionEngine:
+    provider = LiveSnapshotProvider(
+        broker=broker,
+        cache=cache,
+        instrument_token=1,
+        tradingsymbol=SYMBOL,
+        exchange=EXCHANGE,
+        kill_file=kill_file or Path("quote-kill"),
+        live=live,
+        now=lambda: NOW,
+        limits=AccountLimits(),
+        tick_size=TICK,
+    )
+    return ExecutionEngine(
+        broker,
+        provider,
+        tradingsymbol=SYMBOL,
+        exchange=EXCHANGE,
+        lot_size=LOT,
+        tick_size=TICK,
+        kill_file=Path("engine-kill"),
+        monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
+        flatten_timeout=5.0,
+        flatten_poll_interval=0.25,
+        flatten_max_adverse_ticks=4,
+    )
+
+
+async def _prove_refused(engine: ExecutionEngine, broker: FakeBroker, reason: str, stamp: int) -> None:
+    before = len(broker.orders)
+    refused = await engine.submit_entry(
+        side="buy",
+        limit_price=Decimal("100"),
+        quantity=LOT,
+        stop_price=Decimal("99"),
+        strategy_id="trend",
+        timestamp_ms=stamp,
+    )
+    assert refused.order is None
+    assert refused.decision.allowed is False
+    assert refused.decision.reason == reason
+    assert len(broker.orders) == before
+    closed = await engine.submit_exit(
+        side="sell",
+        limit_price=Decimal("101"),
+        quantity=LOT,
+        strategy_id="trend",
+        timestamp_ms=stamp + 1,
+    )
+    flattened = await engine._submit(
+        intent=Intent.FLATTEN,
+        side="sell",
+        limit_price=Decimal("101"),
+        quantity=LOT,
+        strategy_id="flatten",
+        timestamp_ms=stamp + 2,
+        planned_loss=Decimal("0"),
+    )
+    assert closed.decision.allowed is True and closed.order is not None
+    assert flattened.decision.allowed is True and flattened.order is not None
+
+
+def test_live_feed_stall_kill_drift_pnl_rejects_and_margin_block_entries() -> None:
+    async def scenario() -> None:
+        async def healthy(broker: FakeBroker) -> None:
+            async def margins():
+                return _healthy_margins()
+
+            broker.get_margins = margins  # type: ignore[method-assign]
+
+        broker = FakeBroker()
+        await healthy(broker)
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW - timedelta(seconds=6), NOW)
+        await _prove_refused(_live_engine(broker, cache), broker, "feed stall", 30_000)
+
+        broker = FakeBroker()
+        await healthy(broker)
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, NOW)
+        kill = Path("session-kill")
+        kill.write_text("stop\n", encoding="utf-8")
+        await _prove_refused(_live_engine(broker, cache, kill_file=kill), broker, "manual kill", 31_000)
+
+        broker = FakeBroker()
+        await healthy(broker)
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, NOW - timedelta(seconds=10))
+        await _prove_refused(_live_engine(broker, cache), broker, "clock drift", 32_000)
+
+        broker = FakeBroker()
+        await healthy(broker)
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, NOW)
+
+        async def rich_pnl():
+            return PositionBook(
+                (BrokerPosition(SYMBOL, EXCHANGE, "MIS", 0, Decimal("100"), 0, Decimal("1000")),),
+                (),
+            )
+
+        broker.get_positions = rich_pnl  # type: ignore[method-assign]
+        await _prove_refused(_live_engine(broker, cache), broker, "pnl mismatch versus broker", 33_000)
+
+        broker = FakeBroker()
+        broker.reject_on_book = True
+        await healthy(broker)
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, NOW)
+        engine = _live_engine(broker, cache)
+        for stamp in (34_000, 35_000, 36_000):
+            result = await engine.submit_entry(
+                side="buy",
+                limit_price=Decimal("100"),
+                quantity=LOT,
+                stop_price=Decimal("99"),
+                strategy_id="trend",
+                timestamp_ms=stamp,
+            )
+            assert result.decision.allowed is True
+            assert result.order is not None
+            assert result.order.status is OrderStatus.REJECTED
+        refused = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=37_000,
+        )
+        assert refused.order is None
+        assert refused.decision.reason == "repeated order rejects"
+        closed = await engine.submit_exit(
+            side="sell",
+            limit_price=Decimal("101"),
+            quantity=LOT,
+            strategy_id="trend",
+            timestamp_ms=38_000,
+        )
+        assert closed.decision.allowed is True and closed.order is not None
+
+        broker = FakeBroker()
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, NOW)
+
+        async def broken_margins():
+            raise RuntimeError("margins down")
+
+        broker.get_margins = broken_margins  # type: ignore[method-assign]
+        await _prove_refused(_live_engine(broker, cache), broker, "margin unknown", 39_000)
+
+        broker = FakeBroker()
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, NOW)
+
+        async def tight_margins():
+            return BrokerMargins(
+                MarginSegment(True, Decimal("100"), Decimal("10"), Decimal("10")),
+                MarginSegment(False, Decimal("0"), Decimal("0"), Decimal("0")),
+            )
+
+        broker.get_margins = tight_margins  # type: ignore[method-assign]
+        await _prove_refused(_live_engine(broker, cache), broker, "insufficient margin", 40_000)
+
+        broker = FakeBroker()
+        engine = ExecutionEngine(
+            broker,
+            _RaisingProvider(),  # type: ignore[arg-type]
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            lot_size=LOT,
+            tick_size=TICK,
+            kill_file=Path("engine-kill"),
+            monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
+            flatten_timeout=5.0,
+            flatten_poll_interval=0.25,
+            flatten_max_adverse_ticks=4,
+        )
+        await _prove_refused(engine, broker, "risk snapshot unavailable", 41_000)
+
+    asyncio.run(scenario())
+
+
+def test_live_mode_does_not_skip_a_missing_broker_pnl_or_exchange_time() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, None)
+
+        async def healthy_margins():
+            return _healthy_margins()
+
+        broker.get_margins = healthy_margins  # type: ignore[method-assign]
+        live_missing_time = _live_engine(broker, cache, live=True)
+        missing_time = await live_missing_time.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=50_000,
+        )
+        assert missing_time.order is None
+        assert missing_time.decision.allowed is False
+
+        research = FakeBroker()
+        research.get_margins = healthy_margins  # type: ignore[method-assign]
+        research_cache = MemoryQuoteCache()
+        research_cache.values[1] = _cached_quote(NOW, None)
+        backtest = _live_engine(research, research_cache, live=False)
+        allowed = await backtest.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=51_000,
+        )
+        assert allowed.decision.allowed is True
+        assert allowed.order is not None
+
+        blind = FakeBroker()
+
+        async def pnl_not_reported():
+            return PositionBook(
+                (BrokerPosition(SYMBOL, EXCHANGE, "MIS", 0, Decimal("100"), 0, None),),
+                (),
+            )
+
+        blind.get_positions = pnl_not_reported  # type: ignore[method-assign]
+        blind.get_margins = healthy_margins  # type: ignore[method-assign]
+        priced = MemoryQuoteCache()
+        priced.values[1] = _cached_quote(NOW, NOW)
+        live_missing_pnl = _live_engine(blind, priced, live=True)
+        refused = await live_missing_pnl.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=52_000,
         )
         assert refused.order is None
         assert refused.decision.allowed is False
