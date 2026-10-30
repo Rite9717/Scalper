@@ -8,6 +8,7 @@ LiveSnapshotProvider, which fails closed when an input is missing.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable, Sequence
 from time import monotonic
 from dataclasses import dataclass, replace
@@ -143,6 +144,7 @@ class LiveSnapshotProvider:
         self._quote_task: asyncio.Task[object] | None = None
         self._pos_task: asyncio.Task[object] | None = None
         self._mar_task: asyncio.Task[object] | None = None
+        self._pending: list[asyncio.Task[object]] = []
         self._orders: list[datetime] = []
         self._rejects: list[datetime] = []
 
@@ -154,17 +156,44 @@ class LiveSnapshotProvider:
 
     def begin(self) -> None:
         """Start the cache, position, and margin reads together."""
+        self._release_current()
         if self._replay is not None and self._clock() < self._miss_until:
             quote, positions, margins = self._replay
             self._replayed = True
-            self._quote_task = asyncio.create_task(self._ready(quote))
-            self._pos_task = asyncio.create_task(self._ready(positions))
-            self._mar_task = asyncio.create_task(self._ready(margins))
+            self._quote_task = self._start(self._ready(quote))
+            self._pos_task = self._start(self._ready(positions))
+            self._mar_task = self._start(self._ready(margins))
             return
         self._replayed = False
-        self._quote_task = asyncio.create_task(self._bounded(self._load_quote()))
-        self._pos_task = asyncio.create_task(self._bounded(self.broker.get_positions()))
-        self._mar_task = asyncio.create_task(self._bounded(self.broker.get_margins()))
+        self._quote_task = self._start(self._bounded(self._load_quote))
+        self._pos_task = self._start(self._bounded(self.broker.get_positions))
+        self._mar_task = self._start(self._bounded(self.broker.get_margins))
+
+    def _start(self, awaitable: Awaitable[object]) -> asyncio.Task[object]:
+        task = asyncio.create_task(awaitable)
+        self._pending.append(task)
+        return task
+
+    def _release_current(self) -> None:
+        for task in (self._quote_task, self._pos_task, self._mar_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._quote_task = None
+        self._pos_task = None
+        self._mar_task = None
+
+    async def close_reads(self) -> None:
+        """Await or cancel every read begin() started."""
+        tasks = list(self._pending)
+        self._pending.clear()
+        self._quote_task = None
+        self._pos_task = None
+        self._mar_task = None
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def positions(self) -> object | None:
         if self._pos_task is None or self._pos_task.done():
@@ -180,17 +209,36 @@ class LiveSnapshotProvider:
         planned_loss: Decimal,
         orders: Sequence[ManagedOrder],
     ) -> RiskSnapshot:
+        try:
+            return await self._build(
+                lots_requested=lots_requested,
+                open_lots=open_lots,
+                planned_loss=planned_loss,
+                orders=orders,
+            )
+        finally:
+            await self.close_reads()
+
+    async def _build(
+        self,
+        *,
+        lots_requested: int,
+        open_lots: int,
+        planned_loss: Decimal,
+        orders: Sequence[ManagedOrder],
+    ) -> RiskSnapshot:
         now = self._now()
         limits = self.limits
         killed = self._kill_flag()
         if self._quote_task is None or self._pos_task is None or self._mar_task is None:
             self.begin()
-        quote = await self._quote_task
-        position_book = await self._pos_task
-        margin_book = await self._mar_task
-        self._quote_task = None
-        self._pos_task = None
-        self._mar_task = None
+        quote_task = self._quote_task
+        position_task = self._pos_task
+        margin_task = self._mar_task
+        assert quote_task is not None and position_task is not None and margin_task is not None
+        quote = await quote_task
+        position_book = await position_task
+        margin_book = await margin_task
         if isinstance(quote, tuple):
             last_quote_at, exchange_time, cached_last, quote_missing = quote
         else:
@@ -254,34 +302,37 @@ class LiveSnapshotProvider:
     async def _ready(self, value: object) -> object:
         return value
 
-    async def _bounded(self, awaitable: Awaitable[object]) -> object | None:
+    async def _bounded(self, start: Callable[[], Awaitable[object]]) -> object | None:
         """One read. A timeout or error is a missing input."""
-        if self._sleep is None:
-            try:
-                return await asyncio.wait_for(awaitable, self.read_timeout)
-            except (TimeoutError, asyncio.TimeoutError, Exception):
-                return None
-        task = asyncio.ensure_future(awaitable)
-        timer = asyncio.ensure_future(self._sleep(self.read_timeout))
+        awaitable = start()
         try:
-            done, pending = await asyncio.wait({task, timer}, return_when=asyncio.FIRST_COMPLETED)
-        except Exception:
-            task.cancel()
-            timer.cancel()
-            return None
-        for item in pending:
-            item.cancel()
-        for item in pending:
+            if self._sleep is None:
+                try:
+                    return await asyncio.wait_for(awaitable, self.read_timeout)
+                except (TimeoutError, asyncio.TimeoutError, Exception):
+                    return None
+            task: asyncio.Task[object] | None = None
+            timer: asyncio.Task[object] | None = None
             try:
-                await item
-            except (asyncio.CancelledError, Exception):
-                pass
-        if task not in done or task.cancelled():
-            return None
-        error = task.exception()
-        if error is not None:
-            return None
-        return task.result()
+                task = asyncio.ensure_future(awaitable)
+                timer = asyncio.ensure_future(self._sleep(self.read_timeout))
+                done, _pending = await asyncio.wait({task, timer}, return_when=asyncio.FIRST_COMPLETED)
+                if task not in done or task.cancelled():
+                    return None
+                error = task.exception()
+                if error is not None:
+                    return None
+                return task.result()
+            finally:
+                children = [item for item in (task, timer) if item is not None]
+                for item in children:
+                    if not item.done():
+                        item.cancel()
+                if children:
+                    await asyncio.gather(*children, return_exceptions=True)
+        finally:
+            if inspect.iscoroutine(awaitable) and inspect.getcoroutinestate(awaitable) is inspect.CORO_CREATED:
+                awaitable.close()
 
     async def _load_quote(self) -> tuple[datetime | None, datetime | None, Decimal | None, bool]:
         try:

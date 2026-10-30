@@ -1064,6 +1064,95 @@ def test_hanging_reads_refuse_the_entry_and_still_place_the_flatten() -> None:
     asyncio.run(scenario())
 
 
+def _unfinished_tasks() -> list[asyncio.Task[object]]:
+    current = asyncio.current_task()
+    return [task for task in asyncio.all_tasks() if task is not current]
+
+
+def test_build_failure_leaves_no_pending_read_tasks() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+        parked = asyncio.Event()
+
+        async def hang() -> None:
+            await parked.wait()
+
+        async def hang_quote(_token: int) -> None:
+            await parked.wait()
+
+        broker.get_positions = hang  # type: ignore[method-assign]
+        broker.get_margins = hang  # type: ignore[method-assign]
+        cache = MemoryQuoteCache()
+        cache.get = hang_quote  # type: ignore[method-assign]
+
+        class FailingBuild(LiveSnapshotProvider):
+            async def positions(self) -> None:
+                return None
+
+            async def build(self, **_kwargs: object) -> RiskSnapshot:
+                raise RuntimeError("snapshot failed")
+
+        provider = FailingBuild(
+            broker=broker,
+            cache=cache,
+            instrument_token=1,
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            kill_file=Path("pending-kill"),
+            live=True,
+            now=lambda: NOW,
+            limits=AccountLimits(trading_mode="live"),
+            tick_size=TICK,
+            read_timeout=30.0,
+        )
+        engine = ExecutionEngine(
+            broker,
+            provider,
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            lot_size=LOT,
+            tick_size=TICK,
+            kill_file=Path("engine-kill"),
+            monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
+            flatten_timeout=5.0,
+            flatten_poll_interval=0.25,
+            flatten_max_adverse_ticks=4,
+        )
+        entry = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=72_000,
+        )
+        assert entry.order is None
+        assert entry.decision.reason == "risk snapshot unavailable"
+        assert _unfinished_tasks() == []
+        closed = await engine.submit_exit(
+            side="sell",
+            limit_price=Decimal("101"),
+            quantity=LOT,
+            strategy_id="trend",
+            timestamp_ms=73_000,
+        )
+        assert closed.order is not None and closed.order.broker_order_id in broker.orders
+        assert _unfinished_tasks() == []
+        flattened = await engine._submit(
+            intent=Intent.FLATTEN,
+            side="sell",
+            limit_price=Decimal("101"),
+            quantity=LOT,
+            strategy_id="flatten",
+            timestamp_ms=74_000,
+            planned_loss=Decimal("0"),
+        )
+        assert flattened.order is not None and flattened.order.broker_order_id in broker.orders
+        assert _unfinished_tasks() == []
+
+    asyncio.run(scenario())
+
+
 def test_engine_records_provider_calls_and_a_failed_build_still_places_a_flatten() -> None:
     async def scenario() -> None:
         calls: list[str] = []

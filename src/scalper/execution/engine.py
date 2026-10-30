@@ -344,53 +344,58 @@ class ExecutionEngine:
         start_reads = getattr(self.provider, "begin", None)
         if start_reads is not None:
             start_reads()
-        await self.refresh()
-        if intent is Intent.ENTRY and self.foreign_orders:
-            foreign_id = self.foreign_orders[0].broker_order_id or "unknown"
-            return SubmitResult(None, RiskDecision(False, "halt", f"foreign order {foreign_id}"))
-        existing = self.orders.get(tag)
-        if existing is not None:
-            return SubmitResult(existing, RiskDecision(True, "allow", "duplicate tag"))
-        lots = max(1, quantity // self.lot_size)
-        open_lots = abs(self.position_quantity) // self.lot_size
         try:
-            snapshot = await self.provider.build(
-                lots_requested=lots,
-                open_lots=open_lots,
-                planned_loss=planned_loss,
-                orders=list(self.orders.values()),
-            )
-        except Exception:
-            if intent is Intent.ENTRY:
-                return SubmitResult(None, RiskDecision(False, "halt", "risk snapshot unavailable"))
-            snapshot = _protective_snapshot(lots_requested=lots, open_lots=open_lots, planned_loss=planned_loss)
-        decision = assess(intent, snapshot)
-        if not decision.allowed:
-            return SubmitResult(None, decision)
-        self._our_tags.add(tag)
-        self.provider.note_order()
-        try:
-            await place_live_limit(
-                self.broker,
-                ManagedOrder(
-                    tag=tag,
-                    side=side,
-                    limit_price=limit_price,
-                    quantity=quantity,
-                    intent=intent.value,
-                    tradingsymbol=self.tradingsymbol,
-                    exchange=self.exchange,
-                    product=_PRODUCT,
-                ),
-                kill_file=self.kill_file,
-                monitor=self.monitor,
-            )
-        except AmbiguousOrderOutcome:
-            raise
-        booked = await self._confirm_tag(tag)
-        self.orders[tag] = booked
-        self._note_reject(booked)
-        return SubmitResult(booked, decision)
+            await self.refresh()
+            if intent is Intent.ENTRY and self.foreign_orders:
+                foreign_id = self.foreign_orders[0].broker_order_id or "unknown"
+                return SubmitResult(None, RiskDecision(False, "halt", f"foreign order {foreign_id}"))
+            existing = self.orders.get(tag)
+            if existing is not None:
+                return SubmitResult(existing, RiskDecision(True, "allow", "duplicate tag"))
+            lots = max(1, quantity // self.lot_size)
+            open_lots = abs(self.position_quantity) // self.lot_size
+            try:
+                snapshot = await self.provider.build(
+                    lots_requested=lots,
+                    open_lots=open_lots,
+                    planned_loss=planned_loss,
+                    orders=list(self.orders.values()),
+                )
+            except Exception:
+                if intent is Intent.ENTRY:
+                    return SubmitResult(None, RiskDecision(False, "halt", "risk snapshot unavailable"))
+                snapshot = _protective_snapshot(lots_requested=lots, open_lots=open_lots, planned_loss=planned_loss)
+            decision = assess(intent, snapshot)
+            if not decision.allowed:
+                return SubmitResult(None, decision)
+            self._our_tags.add(tag)
+            self.provider.note_order()
+            try:
+                await place_live_limit(
+                    self.broker,
+                    ManagedOrder(
+                        tag=tag,
+                        side=side,
+                        limit_price=limit_price,
+                        quantity=quantity,
+                        intent=intent.value,
+                        tradingsymbol=self.tradingsymbol,
+                        exchange=self.exchange,
+                        product=_PRODUCT,
+                    ),
+                    kill_file=self.kill_file,
+                    monitor=self.monitor,
+                )
+            except AmbiguousOrderOutcome:
+                raise
+            booked = await self._confirm_tag(tag)
+            self.orders[tag] = booked
+            self._note_reject(booked)
+            return SubmitResult(booked, decision)
+        finally:
+            close = getattr(self.provider, "close_reads", None)
+            if close is not None:
+                await close()
 
     async def _confirm_tag(self, tag: str) -> ManagedOrder:
         interval = _BOOK_CONFIRM_WINDOW_SECONDS / (_BOOK_CONFIRM_READS - 1)
