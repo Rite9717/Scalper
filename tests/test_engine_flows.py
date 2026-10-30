@@ -1236,6 +1236,72 @@ def test_engine_records_provider_calls_and_a_failed_build_still_places_a_flatten
     asyncio.run(scenario())
 
 
+def test_rejects_spaced_a_minute_apart_still_halt_entries() -> None:
+    async def scenario() -> None:
+        moment = {"now": NOW}
+        broker = FakeBroker()
+        broker.reject_on_book = True
+
+        async def margins():
+            return _healthy_margins()
+
+        broker.get_margins = margins  # type: ignore[method-assign]
+        cache = MemoryQuoteCache()
+        provider = LiveSnapshotProvider(
+            broker=broker,
+            cache=cache,
+            instrument_token=1,
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            kill_file=Path("reject-kill"),
+            live=True,
+            now=lambda: moment["now"],
+            limits=AccountLimits(trading_mode="live"),
+            tick_size=TICK,
+        )
+        engine = ExecutionEngine(
+            broker,
+            provider,
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            lot_size=LOT,
+            tick_size=TICK,
+            kill_file=Path("engine-kill"),
+            monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
+            flatten_timeout=5.0,
+            flatten_poll_interval=0.25,
+            flatten_max_adverse_ticks=4,
+        )
+        for step in range(3):
+            moment["now"] = NOW + timedelta(seconds=61 * step)
+            cache.values[1] = _cached_quote(moment["now"], moment["now"])
+            placed = await engine.submit_entry(
+                side="buy",
+                limit_price=Decimal("100"),
+                quantity=LOT,
+                stop_price=Decimal("99"),
+                strategy_id="trend",
+                timestamp_ms=90_000 + step,
+            )
+            assert placed.decision.allowed is True
+            assert placed.order is not None
+            assert placed.order.status is OrderStatus.REJECTED
+        moment["now"] = NOW + timedelta(seconds=61 * 3)
+        cache.values[1] = _cached_quote(moment["now"], moment["now"])
+        refused = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=93_000,
+        )
+        assert refused.order is None
+        assert refused.decision.reason == "repeated order rejects"
+
+    asyncio.run(scenario())
+
+
 def test_live_flag_must_agree_with_trading_mode_and_the_lot_cap() -> None:
     broker = FakeBroker()
     cache = MemoryQuoteCache()

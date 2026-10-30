@@ -91,7 +91,7 @@ class AccountLimits:
     clock_drift_limit: timedelta = timedelta(seconds=2)
     max_rejects: int = 3
     flatten_time: time = time(15, 20)
-    reject_window: timedelta = timedelta(minutes=1)
+    reject_window: timedelta | None = None  # None keeps every reject for the session
 
 
 class LiveSnapshotProvider:
@@ -388,7 +388,9 @@ class LiveSnapshotProvider:
             return None, None, True
         return equity.live_balance, equity.net, False
 
-    def _since(self, events: list[datetime], now: datetime, window: timedelta) -> int:
+    def _since(self, events: list[datetime], now: datetime, window: timedelta | None) -> int:
+        if window is None:
+            return len(events)
         cutoff = now - window
         return sum(1 for moment in events if moment >= cutoff)
 
