@@ -464,6 +464,35 @@ def test_a_drop_with_an_open_position_alerts_that_stops_are_blind() -> None:
     asyncio.run(scenario())
 
 
+def test_repeated_drops_alert_once_until_a_tick_clears_them() -> None:
+    async def scenario() -> None:
+        runner, _journal, clock = _runner(strategy=_Script([_good_signal()]))
+        await runner.journal.start_run(
+            run_id=runner.run_id,
+            started_at=DAY,
+            strategy="trend_pullback",
+            tradingsymbol="NIFTY26OCTFUT",
+            limits=runner.limits_record,
+        )
+        for tick in _position_ticks():
+            clock["now"] = tick.received_at
+            await runner._on_quote(tick)
+        runner.monitor.sink.messages.clear()  # type: ignore[attr-defined]
+        for _ in range(3):
+            await runner._on_drop()
+        messages = runner.monitor.sink.messages  # type: ignore[attr-defined]
+        assert sum("Feed stall" in message for message in messages) == 1
+        assert sum("feed is blind" in message for message in messages) == 1
+        fresh = DAY + timedelta(minutes=2, seconds=5)
+        clock["now"] = fresh
+        await runner._on_quote(_quote(fresh, "100", 70))
+        await runner._on_drop()
+        assert sum("Feed stall" in message for message in messages) == 2
+        assert sum("feed is blind" in message for message in messages) == 2
+
+    asyncio.run(scenario())
+
+
 def test_the_first_tick_after_a_reconnect_still_checks_the_stop() -> None:
     async def scenario() -> None:
         runner, _journal, clock = _runner(strategy=_Script([_good_signal()]))

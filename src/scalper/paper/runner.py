@@ -229,7 +229,6 @@ class PaperRunner:
         drop = getattr(self.cache, "drop", None)
         if drop is not None:
             await drop(self.token)
-        self._stall_open = False
         await self.monitor.feed_stall(self.paper.stale_after.total_seconds())
         self._stall_open = True
         if self.position is not None:
@@ -254,8 +253,9 @@ class PaperRunner:
             self._bar_minute = minute
             self._bar_open = quote.last_price
         await self.cache.put(quote)
-        if not self.gap:
-            await self.monitor.stops_covered()
+        await self.monitor.feed_resumed()
+        await self.monitor.stops_covered()
+        self._stall_open = False
         finished = self.book.add(quote)
         if (
             finished is not None
