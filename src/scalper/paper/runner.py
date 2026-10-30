@@ -134,7 +134,6 @@ class PaperRunner:
         self.gap = False
         self._stop = asyncio.Event()
         self._stall_open = False
-        self._reconnect_wait = paper.reconnect_initial_seconds
         self._fail_closed_done = False
         self.charges = charges or ChargeSchedule()
         self.expiry_dates = set(expiry_dates or ())
@@ -237,25 +236,6 @@ class PaperRunner:
             age = 0.0 if self.last_tick_at is None else (self._now() - self.last_tick_at).total_seconds()
             await self.monitor.stops_blind(age)
         self._log.warning("websocket_dropped")
-        await self._sleep_until_stop(self._reconnect_wait)
-        self._reconnect_wait = min(self._reconnect_wait * 2, self.paper.reconnect_max_seconds)
-
-    async def _sleep_until_stop(self, seconds: float) -> None:
-        if self._stop.is_set():
-            return
-        pause = asyncio.ensure_future(self._sleep(seconds))
-        stopped = asyncio.ensure_future(self._stop.wait())
-        try:
-            done, _pending = await asyncio.wait({pause, stopped}, return_when=asyncio.FIRST_COMPLETED)
-        except BaseException:
-            pause.cancel()
-            stopped.cancel()
-            await self._finish(pause, stopped)
-            raise
-        for task in (pause, stopped):
-            if task not in done:
-                task.cancel()
-        await self._finish(pause, stopped)
 
     async def _on_quote(self, quote: NormalizedQuote) -> None:
         self._beat()
@@ -285,7 +265,6 @@ class PaperRunner:
         ):
             self.gap = False
             self._clean_bar = None
-            self._reconnect_wait = self.paper.reconnect_initial_seconds
             await self.monitor.feed_resumed()
             self._stall_open = False
         if finished is not None:

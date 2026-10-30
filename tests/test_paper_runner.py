@@ -464,18 +464,28 @@ def test_a_drop_with_an_open_position_alerts_that_stops_are_blind() -> None:
     asyncio.run(scenario())
 
 
-def test_reconnect_sleep_stops_when_shutdown_is_requested() -> None:
+def test_the_first_tick_after_a_reconnect_still_checks_the_stop() -> None:
     async def scenario() -> None:
-        runner, _journal, _clock = _runner(strategy=_Script([]))
-
-        async def hang(_seconds: float) -> None:
-            await asyncio.Event().wait()
-
-        runner._sleep = hang
-        task = asyncio.create_task(runner._on_drop())
-        await asyncio.sleep(0)
-        runner.request_stop()
-        await asyncio.wait_for(task, timeout=1)
+        runner, _journal, clock = _runner(strategy=_Script([_good_signal()]))
+        await runner.journal.start_run(
+            run_id=runner.run_id,
+            started_at=DAY,
+            strategy="trend_pullback",
+            tradingsymbol="NIFTY26OCTFUT",
+            limits=runner.limits_record,
+        )
+        for tick in _position_ticks():
+            clock["now"] = tick.received_at
+            await runner._on_quote(tick)
+        assert runner.position is not None
+        await runner._on_drop()
+        fresh = DAY + timedelta(minutes=2, seconds=1)
+        clock["now"] = fresh
+        await runner._on_quote(_quote(fresh, "99", 60))
+        assert runner.gap is True
+        exits = [order for order in runner.broker.orders.values() if order.intent == "exit"]
+        assert exits
+        assert exits[-1].limit_price == Decimal("99")
 
     asyncio.run(scenario())
 
