@@ -120,16 +120,26 @@ class PaperBroker:
         self.orders[tag] = updated
         return updated
 
-    def on_trade(self, price: Decimal, quantity: int) -> list[ManagedOrder]:
+    def on_trade(
+        self,
+        price: Decimal,
+        quantity: int,
+        fill_price: Decimal | None = None,
+    ) -> list[ManagedOrder]:
         self.last_price = price
         changed: list[ManagedOrder] = []
         for tag, order in list(self.orders.items()):
             if not order.working:
                 continue
-            traded = _fill_quantity(order, price, quantity)
+            if fill_price is None:
+                traded = _fill_quantity(order, price, quantity)
+                used = order.limit_price
+            else:
+                traded = min(order.remaining, quantity) if quantity >= 1 else 0
+                used = fill_price
             if traded < 1:
                 continue
-            updated = fill(order, traded, order.limit_price)
+            updated = fill(order, traded, used)
             self.orders[tag] = updated
             changed.append(updated)
         return changed

@@ -129,6 +129,7 @@ async def run_paper(settings: Settings, strategy_name: str) -> int:
         quantity=contract.lot_size * settings.paper_max_lots,
         latency_bars=settings.latency_bars,
         tick_size=contract.tick_size,
+        slippage_ticks=settings.slippage_ticks,
         limits_record=record,
         charges=ChargeSchedule(
             brokerage_rate=settings.brokerage_rate,

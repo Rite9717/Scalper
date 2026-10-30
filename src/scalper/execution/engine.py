@@ -195,11 +195,14 @@ class ExecutionEngine:
         book = await self.refresh()
         return self._require_book_order(order_id, book)
 
-    async def on_trade(self, price: Decimal, quantity: int) -> None:
+    async def on_trade(self, price: Decimal, quantity: int, fill_price: Decimal | None = None) -> None:
         """Apply a paper print when the broker simulates one, then read fills from the book."""
         apply = getattr(self.broker, "on_trade", None)
         if apply is not None:
-            apply(price, quantity)
+            if fill_price is None:
+                apply(price, quantity)
+            else:
+                apply(price, quantity, fill_price)
         await self.refresh()
 
     async def refresh(self) -> list[ManagedOrder]:

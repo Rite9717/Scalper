@@ -10,6 +10,8 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from scalper.backtest.costs import ChargeSchedule
+from scalper.backtest.engine import BacktestSpec, run_backtest
 from scalper.backtest.strategy import EntrySignal, MarketState
 from scalper.strategy.filters import FilterConfig, FilteredStrategy
 from scalper.clock import IST
@@ -177,6 +179,7 @@ def _runner(
         quantity=LOT,
         latency_bars=settings.latency_bars,
         tick_size=TICK,
+        slippage_ticks=settings.slippage_ticks,
         limits_record=resolved_limits(settings, limits),
         pace=False,
     )
@@ -189,6 +192,17 @@ def _good_signal() -> EntrySignal:
 
 def _wide_signal() -> EntrySignal:
     return EntrySignal("buy", Decimal("100"), Decimal("90"), Decimal("110"), 5, "trend")
+
+
+def _position_ticks() -> list[NormalizedQuote]:
+    """Ticks that open one long and do not touch its stop."""
+    return [
+        _quote(DAY, "100", 10),
+        _quote(DAY + timedelta(minutes=1), "100.20", 20),
+        _quote(DAY + timedelta(minutes=1, seconds=5), "99.90", 30),
+        _quote(DAY + timedelta(minutes=1, seconds=10), "100", 40),
+        _quote(DAY + timedelta(minutes=2), "100", 50),
+    ]
 
 
 async def _stream(items: list[object]):
@@ -257,15 +271,10 @@ def test_unfilled_entry_is_cancelled_after_the_backtest_time_stop() -> None:
 def test_sigterm_flattens_an_open_position() -> None:
     async def scenario() -> None:
         broker = _FillFlatten(TICK, LOT, tradingsymbol="NIFTY26OCTFUT", equity_cash=Decimal("1000000"))
-        runner, _journal, clock = _runner(broker=broker, strategy=_Script([None, _good_signal()]))
+        runner, _journal, clock = _runner(broker=broker, strategy=_Script([_good_signal()]))
         loop = asyncio.get_running_loop()
         install_stop_signals(loop, runner)
-        ticks = [
-            _quote(DAY, "100", 10),
-            _quote(DAY + timedelta(minutes=1), "100", 20),
-            _quote(DAY + timedelta(minutes=2), "100.05", 30),
-            _quote(DAY + timedelta(minutes=3), "99.90", 40),
-        ]
+        ticks = _position_ticks()
 
         async def source():
             for tick in ticks:
@@ -291,17 +300,12 @@ def test_sigterm_flattens_an_open_position() -> None:
 def test_a_shutdown_that_cannot_flatten_engages_the_kill_file() -> None:
     async def scenario() -> None:
         runner, _journal, clock = _runner(
-            strategy=_Script([None, _good_signal()]),
+            strategy=_Script([_good_signal()]),
             paper=PaperLimits(flatten_timeout=0.4, flatten_poll_interval=0.5),
             flatten_timeout=0.4,
             flatten_poll=0.5,
         )
-        ticks = [
-            _quote(DAY, "100", 10),
-            _quote(DAY + timedelta(minutes=1), "100", 20),
-            _quote(DAY + timedelta(minutes=2), "100.05", 30),
-            _quote(DAY + timedelta(minutes=3), "99.90", 40),
-        ]
+        ticks = _position_ticks()
 
         async def source():
             for tick in ticks:
@@ -346,29 +350,38 @@ def test_websocket_drop_mid_position_blocks_entries_until_a_fresh_tick() -> None
 
 def test_an_unfilled_stop_is_repriced_then_the_kill_file_is_engaged() -> None:
     async def scenario() -> None:
+        from scalper.paper.exits import ExitTrigger
+
         runner, _journal, clock = _runner(
             strategy=_Script([_good_signal()]),
             paper=PaperLimits(flatten_timeout=30.0, flatten_poll_interval=0.5, flatten_max_adverse_ticks=2),
         )
         ticks = [
             _quote(DAY, "100", 10),
-            _quote(DAY + timedelta(minutes=1), "100.05", 20),
-            _quote(DAY + timedelta(minutes=2), "99.90", 30),
-            _quote(DAY + timedelta(minutes=2, seconds=1), "99", 40),
-            _quote(DAY + timedelta(minutes=2, seconds=2), "99", 50),
+            _quote(DAY + timedelta(minutes=1), "100.30", 20),
+            _quote(DAY + timedelta(minutes=1, seconds=1), "99.70", 30),
+            _quote(DAY + timedelta(minutes=1, seconds=2), "100", 40),
+            _quote(DAY + timedelta(minutes=2), "100", 50),
         ]
-
-        async def source():
-            for tick in ticks:
-                clock["now"] = tick.received_at
-                yield tick
-            assert runner.exit is not None
-            assert runner.exit.order.limit_price == Decimal("98.95")
-            clock["now"] = ticks[-1].received_at + timedelta(seconds=40)
-            yield _quote(DAY + timedelta(minutes=2, seconds=3), "98.90", 60)
-
+        await runner.journal.start_run(
+            run_id=runner.run_id,
+            started_at=DAY,
+            strategy="trend_pullback",
+            tradingsymbol="NIFTY26OCTFUT",
+            limits=runner.limits_record,
+        )
+        for tick in ticks:
+            clock["now"] = tick.received_at
+            await runner._on_quote(tick)
+        assert runner.position is not None
+        await runner._send_exit(ExitTrigger("target", Decimal("102")), clock["now"])
+        assert runner.exit is not None
+        clock["now"] = clock["now"] + timedelta(seconds=1)
+        await runner._work_exit(_quote(clock["now"], "100", 60))
+        assert runner.exit.order.limit_price == Decimal("101.95")
+        clock["now"] = clock["now"] + timedelta(seconds=40)
         with pytest.raises(UnmanagedPosition):
-            await runner.run(source())
+            await runner._work_exit(_quote(clock["now"], "100", 70))
         assert is_killed(Path("paper-kill")) is True
 
     asyncio.run(scenario())
@@ -439,17 +452,12 @@ def test_a_ticker_disconnect_reaches_the_runner_and_blocks_entries() -> None:
 def test_feed_stall_alerts_once_and_an_open_position_goes_blind() -> None:
     async def scenario() -> None:
         runner, _journal, clock = _runner(
-            strategy=_Script([None, _good_signal()]),
+            strategy=_Script([_good_signal()]),
             paper=PaperLimits(stale_after=timedelta(seconds=5), stops_blind_grace=timedelta(seconds=30), flatten_timeout=0.4, flatten_poll_interval=0.5),
             flatten_timeout=0.4,
             flatten_poll=0.5,
         )
-        ticks = [
-            _quote(DAY, "100", 10),
-            _quote(DAY + timedelta(minutes=1), "100", 20),
-            _quote(DAY + timedelta(minutes=2), "100.05", 30),
-            _quote(DAY + timedelta(minutes=3), "99.90", 40),
-        ]
+        ticks = _position_ticks()
 
         async def source():
             for tick in ticks:
@@ -706,6 +714,96 @@ async def _ping_ok() -> None:
     return None
 
 
+class _Once:
+    name = "once"
+
+    def __init__(self) -> None:
+        self.used = False
+
+    def on_bar(self, state: MarketState) -> EntrySignal | None:
+        if self.used or not state.bars:
+            return None
+        self.used = True
+        return EntrySignal("buy", Decimal("100"), Decimal("99"), Decimal("103"), 20, "test")
+
+
+def test_paper_fill_prices_match_the_backtest() -> None:
+    rows = (
+        (Decimal("100"), Decimal("100.2"), Decimal("99.9"), Decimal("100")),
+        (Decimal("100"), Decimal("100.3"), Decimal("99.7"), Decimal("100")),
+        (Decimal("99.5"), Decimal("99.6"), Decimal("98.8"), Decimal("99.2")),
+    )
+    candles = [
+        Candle(
+            instrument_token=1,
+            bucket_start=DAY + timedelta(minutes=index),
+            interval="minute",
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=1,
+            oi=None,
+            source="test",
+        )
+        for index, (open_, high, low, close) in enumerate(rows)
+    ]
+    spec = BacktestSpec(
+        tick_size=TICK,
+        lot_size=LOT,
+        lots=1,
+        charges=ChargeSchedule(spread_ticks=0),
+        cost_multiple=Decimal("0"),
+        slippage_ticks=1,
+        latency_bars=1,
+        flatten_time=datetime.strptime("15:20", "%H:%M").time(),
+        max_loss_per_trade=Decimal("3000"),
+    )
+    backtest = run_backtest(candles, _Once(), spec)
+    assert len(backtest.trades) == 1
+
+    async def scenario() -> tuple[Decimal, Decimal]:
+        runner, journal, clock = _runner(strategy=_Once())  # type: ignore[arg-type]
+        runner.slippage_ticks = spec.slippage_ticks
+        quotes: list[NormalizedQuote] = []
+        volume = 0
+        for bar in candles:
+            for price in (bar.open, bar.high, bar.low, bar.close):
+                volume += 1
+                quotes.append(
+                    NormalizedQuote(
+                        instrument_token=1,
+                        received_at=bar.bucket_start,
+                        exchange_ts=bar.bucket_start,
+                        last_price=price,
+                        last_quantity=1,
+                        volume=volume,
+                        average_price=price,
+                        oi=None,
+                        open=price,
+                        high=price,
+                        low=price,
+                        close=price,
+                        depth=(),
+                    )
+                )
+
+        async def source():
+            for quote in quotes:
+                clock["now"] = quote.received_at
+                yield quote
+            yield Stop()
+
+        await runner.run(source())
+        view = await journal.read(runner.run_id)
+        return Decimal(str(view["fills"][0]["price"])), Decimal(str(view["exits"][0]["fill_price"]))
+
+    entry_price, exit_price = asyncio.run(scenario())
+    trade = backtest.trades[0]
+    assert entry_price == trade.entry_price
+    assert exit_price == trade.exit_price
+
+
 class _BoomJournal(MemoryJournal):
     def __init__(self, method: str) -> None:
         super().__init__()
@@ -757,16 +855,11 @@ def test_journal_order_fill_and_exit_failures_still_flatten_or_kill() -> None:
             await runner.run(source())
         _assert_fail_closed(runner, boom)
 
-    ticks = [
-        _quote(DAY, "100", 10),
-        _quote(DAY + timedelta(minutes=1), "100.05", 20),
-        _quote(DAY + timedelta(minutes=2), "99.90", 30),
-        _quote(DAY + timedelta(minutes=3), "99", 40),
-        _quote(DAY + timedelta(minutes=4), "99.10", 50),
-    ]
-    asyncio.run(scenario("record_order", ticks[:2]))
-    asyncio.run(scenario("record_fill", ticks[:3]))
-    asyncio.run(scenario("record_exit", ticks))
+    held = _position_ticks()
+    stopped = held + [_quote(DAY + timedelta(minutes=3), "99", 60)]
+    asyncio.run(scenario("record_order", held[:2]))
+    asyncio.run(scenario("record_fill", held))
+    asyncio.run(scenario("record_exit", stopped))
 
 
 def test_an_engine_error_mid_loop_is_fail_closed() -> None:

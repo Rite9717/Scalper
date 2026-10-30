@@ -16,6 +16,8 @@ from uuid import UUID
 import structlog
 
 from scalper.backtest.costs import ChargeSchedule, round_trip_charges
+from scalper.backtest.fills import adverse_exit_price, candle_limit_price
+from scalper.data.candles import floor_minute
 from scalper.backtest.strategy import EntrySignal, MarketState, Strategy
 from scalper.clock import ensure_ist
 from scalper.data.cache import QuoteCache
@@ -90,6 +92,7 @@ class PaperRunner:
         quantity: int,
         latency_bars: int,
         tick_size: Decimal,
+        slippage_ticks: int = 0,
         limits_record: dict[str, str],
         pace: bool = True,
         charges: ChargeSchedule | None = None,
@@ -114,7 +117,12 @@ class PaperRunner:
         self.quantity = quantity
         self.latency_bars = latency_bars
         self.tick_size = tick_size
+        if type(slippage_ticks) is not int or slippage_ticks < 0:
+            raise ValueError("slippage_ticks cannot be negative")
+        self.slippage_ticks = slippage_ticks
         self.limits_record = limits_record
+        self._bar_open: Decimal | None = None
+        self._bar_minute: datetime | None = None
         self._pace = pace
         self.bars: list = []
         self.pending: _PendingEntry | None = None
@@ -238,12 +246,17 @@ class PaperRunner:
         self.last_price = quote.last_price
         self.last_tick_at = moment
         self.broker.last_price = quote.last_price
+        minute = floor_minute(moment)
+        if minute != self._bar_minute:
+            self._bar_minute = minute
+            self._bar_open = quote.last_price
         await self.cache.put(quote)
         await self.monitor.stops_covered()
         finished = self.book.add(quote)
         if finished is not None:
             self.bars.append(finished)
             await self._on_bar()
+            await self._fill_completed_bar(finished, len(self.bars) - 1)
         await self._manage_tick(quote)
 
     async def _on_bar(self) -> None:
@@ -307,15 +320,8 @@ class PaperRunner:
 
     async def _manage_tick(self, quote: NormalizedQuote) -> None:
         forming = len(self.bars)
-        if self.pending is not None:
-            if entry_expired(forming_index=forming, last_live=self.pending.last_live):
-                await self._cancel_entry()
-            elif forming >= self.pending.active_from and strict_through(
-                side=self.pending.order.side,
-                price=quote.last_price,
-                limit_price=self.pending.order.limit_price,
-            ):
-                await self._fill_entry(quote)
+        if self.pending is not None and entry_expired(forming_index=forming, last_live=self.pending.last_live):
+            await self._cancel_entry()
         if self.position is not None and self.exit is None:
             trigger = position_trigger(self.position, quote.last_price, forming)
             if trigger is not None:
@@ -323,15 +329,40 @@ class PaperRunner:
         if self.exit is not None:
             await self._work_exit(quote)
 
-    async def _fill_entry(self, quote: NormalizedQuote) -> None:
+    async def _fill_completed_bar(self, bar, index: int) -> None:
+        if self.pending is not None and self.pending.active_from <= index <= self.pending.last_live:
+            price = candle_limit_price(
+                bar,
+                side=self.pending.order.side,
+                limit_price=self.pending.order.limit_price,
+                tick_size=self.tick_size,
+                slippage_ticks=self.slippage_ticks,
+            )
+            if price is not None:
+                await self._fill_entry(price, bar.bucket_start)
+        if self.exit is not None and self.exit.reason == "target":
+            price = candle_limit_price(
+                bar,
+                side=self.exit.order.side,
+                limit_price=self.exit.order.limit_price,
+                tick_size=self.tick_size,
+                slippage_ticks=self.slippage_ticks,
+            )
+            if price is not None:
+                await self.engine.on_trade(price, self.exit.order.quantity, price)
+                order = self.engine.orders.get(self.exit.order.tag)
+                if order is not None and order.status is OrderStatus.FILLED:
+                    await self._record_filled_exit(order, bar.bucket_start)
+
+    async def _fill_entry(self, price: Decimal, at: datetime) -> None:
         assert self.pending is not None
-        await self.engine.on_trade(quote.last_price, self.pending.order.quantity)
+        await self.engine.on_trade(price, self.pending.order.quantity, price)
         order = self.engine.orders.get(self.pending.order.tag)
         if order is None or order.filled_quantity < 1:
             return
         await self.journal.record_fill(
             run_id=self.run_id,
-            at=quote.received_at,
+            at=at,
             tag=order.tag,
             price=order.average_price,
             quantity=order.filled_quantity,
@@ -372,6 +403,9 @@ class PaperRunner:
             await self._abandon(f"exit was not sent: {result.decision.reason}")
             return
         await self._record_order(result.order)
+        if trigger.reason in {"stop", "time"}:
+            await self._fill_protective_exit(result.order, trigger, at)
+            return
         self.exit = WorkingExit(
             order=result.order,
             reason=trigger.reason,
@@ -381,6 +415,38 @@ class PaperRunner:
             started_at=self._now(),
             timestamp_ms=stamp,
         )
+
+    async def _fill_protective_exit(self, placed: ManagedOrder, trigger: ExitTrigger, at: datetime) -> None:
+        assert self.position is not None and self.exit is None
+        bar_open = self._bar_open if self._bar_open is not None else trigger.price
+        exit_side = "sell" if self.position.side == "buy" else "buy"
+        if trigger.reason == "stop" and self.position.side == "buy":
+            gap = bar_open <= self.position.stop_price
+        elif trigger.reason == "stop":
+            gap = bar_open >= self.position.stop_price
+        else:
+            gap = False
+        price = adverse_exit_price(
+            side=exit_side,
+            trigger=trigger.price,
+            bar_open=bar_open,
+            tick_size=self.tick_size,
+            slippage_ticks=self.slippage_ticks,
+            gap_through=gap,
+        )
+        self.exit = WorkingExit(
+            order=placed,
+            reason=trigger.reason,
+            trigger_at=ensure_ist(at),
+            trigger_price=trigger.price,
+            anchor=trigger.price,
+            started_at=self._now(),
+            timestamp_ms=self._millis(at),
+        )
+        await self.engine.on_trade(price, placed.quantity, price)
+        order = self.engine.orders.get(placed.tag)
+        if order is not None and order.status is OrderStatus.FILLED:
+            await self._record_filled_exit(order, at)
 
     async def _work_exit(self, quote: NormalizedQuote) -> None:
         assert self.exit is not None
