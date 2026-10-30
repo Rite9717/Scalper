@@ -1064,6 +1064,89 @@ def test_hanging_reads_refuse_the_entry_and_still_place_the_flatten() -> None:
     asyncio.run(scenario())
 
 
+def test_engine_records_provider_calls_and_a_failed_build_still_places_a_flatten() -> None:
+    async def scenario() -> None:
+        calls: list[str] = []
+        inner = FixedSnapshotProvider(_snapshot())
+
+        class Recording:
+            async def build(self, **kwargs: object) -> RiskSnapshot:
+                calls.append("build")
+                return await inner.build(**kwargs)  # type: ignore[arg-type]
+
+            def note_order(self) -> None:
+                calls.append("note_order")
+                inner.note_order()
+
+            def note_reject(self) -> None:
+                calls.append("note_reject")
+                inner.note_reject()
+
+        broker = FakeBroker()
+        broker.reject_on_book = True
+        engine, _clock = _engine(broker)
+        engine.provider = Recording()  # type: ignore[assignment]
+        rejected = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=80_000,
+        )
+        assert rejected.order is not None
+        assert rejected.order.status is OrderStatus.REJECTED
+        assert calls == ["build", "note_order", "note_reject"]
+
+        failed = _RaisingProvider()
+        broker = FakeBroker()
+        engine = ExecutionEngine(
+            broker,
+            failed,  # type: ignore[arg-type]
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            lot_size=LOT,
+            tick_size=TICK,
+            kill_file=Path("engine-kill"),
+            monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
+            flatten_timeout=5.0,
+            flatten_poll_interval=0.25,
+            flatten_max_adverse_ticks=4,
+        )
+        refused = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=81_000,
+        )
+        assert refused.order is None
+        assert refused.decision.reason == "risk snapshot unavailable"
+        assert broker.orders == {}
+        closed = await engine.submit_exit(
+            side="sell",
+            limit_price=Decimal("101"),
+            quantity=LOT,
+            strategy_id="trend",
+            timestamp_ms=82_000,
+        )
+        flattened = await engine._submit(
+            intent=Intent.FLATTEN,
+            side="sell",
+            limit_price=Decimal("101"),
+            quantity=LOT,
+            strategy_id="flatten",
+            timestamp_ms=83_000,
+            planned_loss=Decimal("0"),
+        )
+        assert closed.order is not None and closed.decision.allowed is True
+        assert flattened.order is not None and flattened.decision.allowed is True
+        assert len(broker.orders) == 2
+
+    asyncio.run(scenario())
+
+
 def test_live_flag_must_agree_with_trading_mode_and_the_lot_cap() -> None:
     broker = FakeBroker()
     cache = MemoryQuoteCache()
