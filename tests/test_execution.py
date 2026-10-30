@@ -89,7 +89,7 @@ def _engine(
         kill_file=Path("KILL"),
         flatten_timeout=5.0,
         flatten_poll_interval=0.25,
-        flatten_worst_price=Decimal("1"),
+        flatten_max_adverse_ticks=4,
         monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
         **kwargs,  # type: ignore[arg-type]
     )

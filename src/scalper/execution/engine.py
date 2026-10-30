@@ -66,7 +66,7 @@ class ExecutionEngine:
         monitor: Monitor,
         flatten_timeout: float,
         flatten_poll_interval: float,
-        flatten_worst_price: Decimal,
+        flatten_max_adverse_ticks: int,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
@@ -84,8 +84,8 @@ class ExecutionEngine:
             or flatten_poll_interval <= 0
         ):
             raise ValueError("flatten poll interval must be positive")
-        if not isinstance(flatten_worst_price, Decimal) or flatten_worst_price <= 0:
-            raise ValueError("flatten worst price must be set")
+        if type(flatten_max_adverse_ticks) is not int or flatten_max_adverse_ticks < 1:
+            raise ValueError("flatten max adverse ticks must be a positive integer")
         self.broker = broker
         self.snapshot = snapshot
         self.tradingsymbol = tradingsymbol
@@ -96,7 +96,7 @@ class ExecutionEngine:
         self.monitor = monitor
         self.flatten_timeout = float(flatten_timeout)
         self.flatten_poll_interval = float(flatten_poll_interval)
-        self.flatten_worst_price = flatten_worst_price
+        self.flatten_max_adverse_ticks = flatten_max_adverse_ticks
         self._monotonic = clock or time.monotonic
         self._sleep = sleep or asyncio.sleep
         self.orders: dict[str, ManagedOrder] = {}
@@ -263,12 +263,19 @@ class ExecutionEngine:
             )
         if result.order.status is OrderStatus.FILLED and self.position_quantity == 0:
             return ShutdownReport(True, 0)
-        await self._drive_flatten(result.order.broker_order_id)
+        worst = _adverse_limit(
+            result.order.side,
+            result.order.limit_price,
+            self.flatten_max_adverse_ticks,
+            self.tick_size,
+        )
+        await self._drive_flatten(result.order.broker_order_id, worst, self._monotonic())
         return ShutdownReport(True, self.position_quantity)
 
-    async def _drive_flatten(self, order_id: str) -> None:
-        deadline = self._monotonic() + self.flatten_timeout
-        last_modify_at: float | None = None
+    async def _drive_flatten(self, order_id: str, worst: Decimal, placed_at: float) -> None:
+        deadline = placed_at + self.flatten_timeout
+        # The first reprice waits one full poll after the order is placed.
+        last_modify_at = placed_at
         while True:
             book = await self.refresh()
             order = self._require_book_order(order_id, book)
@@ -277,9 +284,11 @@ class ExecutionEngine:
             if order.status in TERMINAL:
                 raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
             now = self._monotonic()
-            spaced = last_modify_at is None or now - last_modify_at >= self.flatten_poll_interval
+            if now >= deadline:
+                raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
+            spaced = now - last_modify_at >= self.flatten_poll_interval
             nxt = _worse_price(order.side, order.limit_price, self.tick_size)
-            can_reprice = _price_allowed(order.side, nxt, self.flatten_worst_price) and nxt != order.limit_price
+            can_reprice = _price_allowed(order.side, nxt, worst) and nxt != order.limit_price
             if spaced and can_reprice and self._modifications.get(order_id, 0) >= KITE_MAX_MODIFICATIONS_PER_ORDER:
                 booked = await self.cancel(order_id)
                 if booked.status is not OrderStatus.CANCELLED or booked.remaining < 1:
@@ -309,8 +318,6 @@ class ExecutionEngine:
                 last_modify_at = self._monotonic()
                 await self._sleep(self.flatten_poll_interval)
                 continue
-            if now >= deadline:
-                raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
             await self._sleep(self.flatten_poll_interval)
 
     async def _submit(
@@ -469,9 +476,17 @@ def _worse_price(side: str, price: Decimal, step: Decimal) -> Decimal:
     return price + step
 
 
-def _price_allowed(side: str, price: Decimal, worst: Decimal | None) -> bool:
-    if worst is None:
-        return False
+def _adverse_limit(side: str, start: Decimal, ticks: int, tick_size: Decimal) -> Decimal:
+    move = tick_size * ticks
+    if side == "sell":
+        return start - move
+    if side == "buy":
+        return start + move
+    raise ValueError("side must be buy or sell")
+
+
+def _price_allowed(side: str, price: Decimal, worst: Decimal) -> bool:
+    """True when price is not past the adverse limit for this flatten side."""
     if side == "sell":
         return price >= worst
     if side == "buy":

@@ -164,7 +164,7 @@ def _engine(broker: FakeBroker, **kwargs: object) -> tuple[ExecutionEngine, Fake
         "monitor": Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
         "flatten_timeout": 5.0,
         "flatten_poll_interval": 0.5,
-        "flatten_worst_price": Decimal("50"),
+        "flatten_max_adverse_ticks": 20,
         "clock": clock.monotonic,
         "sleep": clock.sleep,
     }
@@ -289,7 +289,7 @@ def test_flatten_partial_then_complete_ends_flat() -> None:
 def test_flatten_that_never_fills_reports_the_order_and_remaining_size() -> None:
     async def scenario() -> None:
         broker = FakeBroker()
-        engine, _clock = _engine(broker, flatten_timeout=1.0, flatten_worst_price=Decimal("101"))
+        engine, _clock = _engine(broker, flatten_timeout=0.4, flatten_poll_interval=0.5, flatten_max_adverse_ticks=2)
         await _open_long(engine, broker)
         try:
             await engine.shutdown(Decimal("101"))
@@ -305,14 +305,36 @@ def test_flatten_that_never_fills_reports_the_order_and_remaining_size() -> None
     asyncio.run(scenario())
 
 
-def test_flatten_reprice_stops_at_the_configured_worst_price() -> None:
-    async def scenario() -> None:
+async def _open_short(engine: ExecutionEngine, broker: FakeBroker) -> str:
+    placed = await engine.submit_entry(
+        side="sell",
+        limit_price=Decimal("99"),
+        quantity=LOT,
+        stop_price=Decimal("100"),
+        strategy_id="trend",
+        timestamp_ms=2_000,
+    )
+    assert placed.order is not None and placed.order.broker_order_id is not None
+    broker.show(
+        placed.order.broker_order_id,
+        status=OrderStatus.FILLED,
+        filled_quantity=LOT,
+        average_price=Decimal("99"),
+    )
+    await engine.refresh()
+    assert engine.position_quantity == -LOT
+    return placed.order.broker_order_id
+
+
+def test_flatten_reprice_stops_at_the_adverse_tick_limit_for_long_and_short() -> None:
+    async def scenario(long_position: bool) -> None:
         broker = FakeBroker()
+        interval = 0.5
         engine, clock = _engine(
             broker,
             flatten_timeout=3.0,
-            flatten_poll_interval=0.5,
-            flatten_worst_price=Decimal("100.90"),
+            flatten_poll_interval=interval,
+            flatten_max_adverse_ticks=2,
         )
         modified_at: list[float] = []
         original = broker.modify_price
@@ -322,20 +344,29 @@ def test_flatten_reprice_stops_at_the_configured_worst_price() -> None:
             return await original(order_id, limit_price)
 
         broker.modify_price = timed  # type: ignore[method-assign]
-        await _open_long(engine, broker)
+        if long_position:
+            await _open_long(engine, broker)
+            start = Decimal("101")
+            expected = [Decimal("100.95"), Decimal("100.90")]
+        else:
+            await _open_short(engine, broker)
+            start = Decimal("99")
+            expected = [Decimal("99.05"), Decimal("99.10")]
         try:
-            await engine.shutdown(Decimal("101"))
-        except UnmanagedPosition as exc:
-            assert "id-2" in str(exc)
-            assert "remaining 15" in str(exc)
+            await engine.shutdown(start)
+        except UnmanagedPosition:
+            pass
         else:
             raise AssertionError("repriced flatten was marked flat")
-        assert broker.modify_prices == [Decimal("100.95"), Decimal("100.90")]
-        assert modified_at == [0.0, 0.5]
-        assert clock.sleeps[0] == 0.5
-        assert modified_at[1] - modified_at[0] >= engine.flatten_poll_interval
+        assert broker.modify_prices == expected
+        assert modified_at[0] >= interval
+        assert all(modified_at[i] - modified_at[i - 1] >= interval for i in range(1, len(modified_at)))
+        assert clock.sleeps
+        assert all(pause == interval for pause in clock.sleeps)
+        assert modified_at == [interval, interval * 2]
 
-    asyncio.run(scenario())
+    asyncio.run(scenario(True))
+    asyncio.run(scenario(False))
 
 
 def test_flatten_reprice_stops_after_twenty_five_steps() -> None:
@@ -343,8 +374,8 @@ def test_flatten_reprice_stops_after_twenty_five_steps() -> None:
         broker = FakeBroker()
         engine, _clock = _engine(
             broker,
-            flatten_timeout=1.0,
-            flatten_worst_price=Decimal("99.75"),
+            flatten_timeout=30.0,
+            flatten_max_adverse_ticks=25,
         )
         await _open_long(engine, broker)
         try:
