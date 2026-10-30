@@ -980,6 +980,90 @@ def test_gross_pnl_matches_the_broker_after_charges_and_a_real_price_discrepancy
     asyncio.run(scenario())
 
 
+class _OverlapClock:
+    """Concurrent sleeps advance time once, by the longest of the overlapping calls."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        self._batch: list[float] = []
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self._batch.append(seconds)
+        await asyncio.sleep(0)
+        if self._batch:
+            self.now += max(self._batch)
+            self._batch.clear()
+
+
+def test_hanging_reads_refuse_the_entry_and_still_place_the_flatten() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+        parked = asyncio.Event()
+
+        async def hang():
+            await parked.wait()
+
+        broker.get_positions = hang  # type: ignore[method-assign]
+        broker.get_margins = hang  # type: ignore[method-assign]
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, NOW)
+        clock = _OverlapClock()
+        provider = LiveSnapshotProvider(
+            broker=broker,
+            cache=cache,
+            instrument_token=1,
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            kill_file=Path("hang-kill"),
+            live=True,
+            now=lambda: NOW,
+            limits=AccountLimits(trading_mode="live"),
+            tick_size=TICK,
+            read_timeout=2.0,
+            sleep=clock.sleep,
+            clock=lambda: clock.now,
+        )
+        engine = ExecutionEngine(
+            broker,
+            provider,
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            lot_size=LOT,
+            tick_size=TICK,
+            kill_file=Path("engine-kill"),
+            monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
+            flatten_timeout=5.0,
+            flatten_poll_interval=0.25,
+            flatten_max_adverse_ticks=4,
+        )
+        entry = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=70_000,
+        )
+        assert entry.order is None
+        assert entry.decision.allowed is False
+        flat = await engine._submit(
+            intent=Intent.FLATTEN,
+            side="sell",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            strategy_id="flatten",
+            timestamp_ms=71_000,
+            planned_loss=Decimal("0"),
+        )
+        assert flat.order is not None
+        assert flat.decision.allowed is True
+        assert clock.now <= 2.0
+
+    asyncio.run(scenario())
+
+
 def test_live_flag_must_agree_with_trading_mode_and_the_lot_cap() -> None:
     broker = FakeBroker()
     cache = MemoryQuoteCache()

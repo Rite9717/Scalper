@@ -7,7 +7,9 @@ LiveSnapshotProvider, which fails closed when an input is missing.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
+from time import monotonic
 from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from decimal import Decimal
@@ -114,6 +116,9 @@ class LiveSnapshotProvider:
         now: Callable[[], datetime] | None = None,
         schedule: ChargeSchedule | None = None,
         tick_size: Decimal = Decimal("0.05"),
+        read_timeout: float = 2.0,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.broker = broker
         self.cache = cache
@@ -127,6 +132,17 @@ class LiveSnapshotProvider:
         self._now = now or now_ist
         self.schedule = schedule or ChargeSchedule()
         self.tick_size = tick_size
+        if isinstance(read_timeout, bool) or not isinstance(read_timeout, (int, float)) or read_timeout <= 0:
+            raise ValueError("read timeout must be positive")
+        self.read_timeout = float(read_timeout)
+        self._sleep = sleep
+        self._clock = clock or monotonic
+        self._replay: tuple[object, object, object] | None = None
+        self._miss_until = 0.0
+        self._replayed = False
+        self._quote_task: asyncio.Task[object] | None = None
+        self._pos_task: asyncio.Task[object] | None = None
+        self._mar_task: asyncio.Task[object] | None = None
         self._orders: list[datetime] = []
         self._rejects: list[datetime] = []
 
@@ -135,6 +151,26 @@ class LiveSnapshotProvider:
 
     def note_reject(self) -> None:
         self._rejects.append(self._now())
+
+    def begin(self) -> None:
+        """Start the cache, position, and margin reads together."""
+        if self._replay is not None and self._clock() < self._miss_until:
+            quote, positions, margins = self._replay
+            self._replayed = True
+            self._quote_task = asyncio.create_task(self._ready(quote))
+            self._pos_task = asyncio.create_task(self._ready(positions))
+            self._mar_task = asyncio.create_task(self._ready(margins))
+            return
+        self._replayed = False
+        self._quote_task = asyncio.create_task(self._bounded(self._load_quote()))
+        self._pos_task = asyncio.create_task(self._bounded(self.broker.get_positions()))
+        self._mar_task = asyncio.create_task(self._bounded(self.broker.get_margins()))
+
+    async def positions(self) -> object | None:
+        if self._pos_task is None or self._pos_task.done():
+            self.begin()
+        assert self._pos_task is not None
+        return await self._pos_task
 
     async def build(
         self,
@@ -147,9 +183,27 @@ class LiveSnapshotProvider:
         now = self._now()
         limits = self.limits
         killed = self._kill_flag()
-        last_quote_at, exchange_time, cached_last, quote_missing = await self._quote()
-        broker_pnl, pnl_missing, mark = await self._broker_gross(cached_last)
-        available, required, margin_missing = await self._margins()
+        if self._quote_task is None or self._pos_task is None or self._mar_task is None:
+            self.begin()
+        quote = await self._quote_task
+        position_book = await self._pos_task
+        margin_book = await self._mar_task
+        self._quote_task = None
+        self._pos_task = None
+        self._mar_task = None
+        if isinstance(quote, tuple):
+            last_quote_at, exchange_time, cached_last, quote_missing = quote
+        else:
+            last_quote_at, exchange_time, cached_last, quote_missing = None, None, None, True
+        broker_pnl, pnl_missing, mark = self._broker_gross(position_book, cached_last)
+        available, required, margin_missing = self._margins(margin_book)
+        if not self._replayed:
+            if quote is None or position_book is None or margin_book is None:
+                self._replay = (quote, position_book, margin_book)
+                self._miss_until = self._clock() + self.read_timeout
+            else:
+                self._replay = None
+                self._miss_until = 0.0
         gross = _gross_from_fills(orders, mark)
         daily = gross - _charges(orders, self.schedule)
         if self.live and (pnl_missing or exchange_time is None or quote_missing):
@@ -197,7 +251,39 @@ class LiveSnapshotProvider:
         except OSError:
             return True
 
-    async def _quote(self) -> tuple[datetime | None, datetime | None, Decimal | None, bool]:
+    async def _ready(self, value: object) -> object:
+        return value
+
+    async def _bounded(self, awaitable: Awaitable[object]) -> object | None:
+        """One read. A timeout or error is a missing input."""
+        if self._sleep is None:
+            try:
+                return await asyncio.wait_for(awaitable, self.read_timeout)
+            except (TimeoutError, asyncio.TimeoutError, Exception):
+                return None
+        task = asyncio.ensure_future(awaitable)
+        timer = asyncio.ensure_future(self._sleep(self.read_timeout))
+        try:
+            done, pending = await asyncio.wait({task, timer}, return_when=asyncio.FIRST_COMPLETED)
+        except Exception:
+            task.cancel()
+            timer.cancel()
+            return None
+        for item in pending:
+            item.cancel()
+        for item in pending:
+            try:
+                await item
+            except (asyncio.CancelledError, Exception):
+                pass
+        if task not in done or task.cancelled():
+            return None
+        error = task.exception()
+        if error is not None:
+            return None
+        return task.result()
+
+    async def _load_quote(self) -> tuple[datetime | None, datetime | None, Decimal | None, bool]:
         try:
             cached = await self.cache.get(self.instrument_token)
         except Exception:
@@ -211,11 +297,13 @@ class LiveSnapshotProvider:
             return None, exchange_time, last_price, True
         return received, exchange_time, last_price, False
 
-    async def _broker_gross(self, cached_last: Decimal | None) -> tuple[Decimal | None, bool, Decimal | None]:
+    def _broker_gross(
+        self,
+        book: object,
+        cached_last: Decimal | None,
+    ) -> tuple[Decimal | None, bool, Decimal | None]:
         """Gross price PnL of the broker's position, marked at the same last price as our fills."""
-        try:
-            book = await self.broker.get_positions()
-        except Exception:
+        if book is None or not hasattr(book, "net"):
             return None, True, cached_last
         matching = [
             position
@@ -241,10 +329,8 @@ class LiveSnapshotProvider:
             total += (mark - position.average_price) * position.quantity
         return total, False, mark
 
-    async def _margins(self) -> tuple[Decimal | None, Decimal | None, bool]:
-        try:
-            margins = await self.broker.get_margins()
-        except Exception:
+    def _margins(self, margins: object) -> tuple[Decimal | None, Decimal | None, bool]:
+        if margins is None or not hasattr(margins, "equity"):
             return None, None, True
         equity = margins.equity
         if not equity.enabled:

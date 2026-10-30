@@ -341,6 +341,9 @@ class ExecutionEngine:
         tag = make_order_tag(timestamp_ms=timestamp_ms, strategy_id=strategy_id, sequence=sequence)
         if intent is Intent.ENTRY and entries_halted():
             return SubmitResult(None, RiskDecision(False, "halt", entry_halt_reason()))
+        start_reads = getattr(self.provider, "begin", None)
+        if start_reads is not None:
+            start_reads()
         await self.refresh()
         if intent is Intent.ENTRY and self.foreign_orders:
             foreign_id = self.foreign_orders[0].broker_order_id or "unknown"
@@ -446,7 +449,13 @@ class ExecutionEngine:
         raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {', '.join(ids)}")
 
     async def _check_broker_position(self) -> None:
-        positions = await self.broker.get_positions()
+        fetch = getattr(self.provider, "positions", None)
+        try:
+            positions = await fetch() if fetch is not None else await self.broker.get_positions()
+        except Exception:
+            return
+        if positions is None:
+            return
         broker_qty = sum(
             position.quantity
             for position in positions.net
