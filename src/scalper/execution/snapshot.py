@@ -98,9 +98,10 @@ class LiveSnapshotProvider:
     """Builds a snapshot from the quote cache, the broker, and the kill file.
 
     live=True fails closed when broker PnL or the exchange timestamp is missing.
-    The gate treats those Nones as "skip this check", so the provider instead
-    clears the quote and the margin fields, which the gate already uses to halt
-    entries. live=False leaves the Nones in place for backtests.
+    fail_closed=True does the same without turning on live trading. The gate
+    treats those Nones as "skip this check", so the provider instead clears the
+    quote and the margin fields, which the gate already uses to halt entries.
+    Both flags left false keep the Nones in place for backtests.
     """
 
     def __init__(
@@ -113,6 +114,7 @@ class LiveSnapshotProvider:
         exchange: str,
         kill_file: Path,
         live: bool,
+        fail_closed: bool = False,
         limits: AccountLimits | None = None,
         now: Callable[[], datetime] | None = None,
         schedule: ChargeSchedule | None = None,
@@ -128,6 +130,7 @@ class LiveSnapshotProvider:
         self.exchange = exchange
         self.kill_file = kill_file
         self.live = live
+        self.fail_closed = fail_closed
         self.limits = limits or AccountLimits(trading_mode="live" if live else "paper")
         _require_live_mode(self.live, self.limits)
         self._now = now or now_ist
@@ -254,7 +257,7 @@ class LiveSnapshotProvider:
                 self._miss_until = 0.0
         gross = _gross_from_fills(orders, mark)
         daily = gross - _charges(orders, self.schedule)
-        if self.live and (pnl_missing or exchange_time is None or quote_missing):
+        if (self.live or self.fail_closed) and (pnl_missing or exchange_time is None or quote_missing):
             last_quote_at = None
             available = None
             required = None

@@ -683,6 +683,7 @@ def _live_engine(
     cache: MemoryQuoteCache,
     *,
     live: bool = True,
+    fail_closed: bool = False,
     kill_file: Path | None = None,
 ) -> ExecutionEngine:
     provider = LiveSnapshotProvider(
@@ -693,6 +694,7 @@ def _live_engine(
         exchange=EXCHANGE,
         kill_file=kill_file or Path("quote-kill"),
         live=live,
+        fail_closed=fail_closed,
         now=lambda: NOW,
         limits=AccountLimits(trading_mode="live" if live else "paper"),
         tick_size=TICK,
@@ -1423,6 +1425,54 @@ def test_live_mode_does_not_skip_a_missing_broker_pnl_or_exchange_time() -> None
         )
         assert refused.order is None
         assert refused.decision.allowed is False
+
+    asyncio.run(scenario())
+
+
+def test_fail_closed_paper_snapshot_halts_entries_when_quote_time_or_pnl_is_missing() -> None:
+    async def scenario() -> None:
+        async def margins():
+            return _healthy_margins()
+
+        broker = FakeBroker()
+        broker.get_margins = margins  # type: ignore[method-assign]
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, None)
+        await _prove_refused(
+            _live_engine(broker, cache, live=False, fail_closed=True),
+            broker,
+            "feed stall",
+            53_000,
+        )
+
+        broker = FakeBroker()
+        broker.get_margins = margins  # type: ignore[method-assign]
+        empty = MemoryQuoteCache()
+        await _prove_refused(
+            _live_engine(broker, empty, live=False, fail_closed=True),
+            broker,
+            "feed stall",
+            54_000,
+        )
+
+        broker = FakeBroker()
+
+        async def pnl_not_reported():
+            return PositionBook(
+                (BrokerPosition(SYMBOL, EXCHANGE, "MIS", 0, Decimal("100"), 0, None),),
+                (),
+            )
+
+        broker.get_positions = pnl_not_reported  # type: ignore[method-assign]
+        broker.get_margins = margins  # type: ignore[method-assign]
+        priced = MemoryQuoteCache()
+        priced.values[1] = _cached_quote(NOW, NOW)
+        await _prove_refused(
+            _live_engine(broker, priced, live=False, fail_closed=True),
+            broker,
+            "feed stall",
+            55_000,
+        )
 
     asyncio.run(scenario())
 
