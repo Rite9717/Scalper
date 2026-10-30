@@ -17,6 +17,8 @@ class Metrics:
     feed_stalled: Gauge
     quote_age_seconds: Gauge
     daily_pnl: Gauge
+    heartbeat: Gauge
+    stops_blind_seconds: Gauge
 
 
 def build_metrics(registry: CollectorRegistry | None = None) -> Metrics:
@@ -59,6 +61,16 @@ def build_metrics(registry: CollectorRegistry | None = None) -> Metrics:
         daily_pnl=Gauge(
             "scalper_daily_pnl",
             "Net pnl for the current session day",
+            registry=target,
+        ),
+        heartbeat=Gauge(
+            "scalper_heartbeat_timestamp",
+            "Unix time of the latest paper-loop heartbeat",
+            registry=target,
+        ),
+        stops_blind_seconds=Gauge(
+            "scalper_stops_blind_seconds",
+            "Seconds an open position has gone without a tick",
             registry=target,
         ),
     )

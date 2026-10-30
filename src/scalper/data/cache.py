@@ -24,6 +24,9 @@ class MemoryQuoteCache:
     async def get(self, instrument_token: int) -> dict[str, object] | None:
         return self.values.get(instrument_token)
 
+    async def drop(self, instrument_token: int) -> None:
+        self.values.pop(instrument_token, None)
+
 
 class RedisQuoteCache:
     def __init__(self, client: object, *, ttl_seconds: int = 86_400) -> None:
@@ -36,6 +39,9 @@ class RedisQuoteCache:
     async def put(self, quote: NormalizedQuote) -> None:
         payload = json.dumps(quote.to_cache())
         await self._client.set(self._key(quote.instrument_token), payload, ex=self._ttl)  # type: ignore[attr-defined]
+
+    async def drop(self, instrument_token: int) -> None:
+        await self._client.delete(self._key(instrument_token))  # type: ignore[attr-defined]
 
     async def get(self, instrument_token: int) -> dict[str, object] | None:
         raw = await self._client.get(self._key(instrument_token))  # type: ignore[attr-defined]

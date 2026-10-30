@@ -50,6 +50,7 @@ class Monitor:
     sink: AlertSink
     _feed_open: bool = False
     _kill_open: bool = False
+    _blind_open: bool = False
 
     async def risk_veto(self, reason: str) -> None:
         self.metrics.risk_vetoes.labels(reason=reason).inc()
@@ -69,6 +70,20 @@ class Monitor:
             return
         self._feed_open = True
         await self._emit("feed_stall", f"Feed stall. Last quote is {age_seconds:.0f} seconds old.")
+
+    async def stops_blind(self, seconds: float) -> None:
+        self.metrics.stops_blind_seconds.set(seconds)
+        if self._blind_open:
+            return
+        self._blind_open = True
+        await self._emit("stops_blind", f"Open position and the feed is blind. {seconds:.0f} seconds without a tick.")
+
+    async def stops_covered(self) -> None:
+        self._blind_open = False
+        self.metrics.stops_blind_seconds.set(0)
+
+    def beat(self, unix_time: float) -> None:
+        self.metrics.heartbeat.set(unix_time)
 
     async def feed_resumed(self) -> None:
         self._feed_open = False

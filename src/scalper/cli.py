@@ -26,6 +26,9 @@ from scalper.backtest.engine import BacktestSpec, load_candles, run_backtest
 from scalper.backtest.report import result_report, windows_covering
 from scalper.ops.go_live import render_checklist
 from scalper.risk.killfile import KillFileError, engage, kill_path, release
+from scalper.execution.engine import UnmanagedPosition
+from scalper.paper.command import run_paper
+from scalper.paper.startup import PaperStartupError
 from scalper.strategy.registry import STRATEGY_NAMES, build_strategy
 from scalper.clock import IST, now_ist, today_ist
 from scalper.compliance import ComplianceError, LIVE_CONFIRMATION_PHRASE, position_lot_cap
@@ -89,6 +92,9 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--to", dest="end", required=True)
     history.add_argument("--interval", default="minute")
     history.add_argument("--as-of", dest="as_of", default=None)
+
+    paper = sub.add_parser("paper", help="Run the paper loop on live Kite ticks. Orders are not sent.")
+    paper.add_argument("--strategy", required=True, choices=("trend_pullback", "vwap_reversion"))
 
     backtest = sub.add_parser("backtest", help="Replay a candle file. The plumbing strategy claims no edge.")
     backtest.add_argument("--candles", required=True, type=Path)
@@ -280,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.interval,
                 )
             )
+        if args.command == "paper":
+            return asyncio.run(run_paper(settings, args.strategy))
         if args.command == "backtest":
             return _run_backtest(settings, args)
         if args.command == "kill":
@@ -296,6 +304,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "go-live":
             sys.stdout.write(render_checklist())
             return 2
+    except PaperStartupError as exc:
+        structlog.get_logger().error("paper_startup_refused", reason=str(exc))
+        return 2
+    except UnmanagedPosition as exc:
+        structlog.get_logger().error("paper_not_flat", reason=str(exc))
+        return 1
     except ComplianceError as exc:
         structlog.get_logger().error("compliance_refused", reason=str(exc))
         return 2
