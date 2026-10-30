@@ -123,6 +123,7 @@ class PaperRunner:
         self.limits_record = limits_record
         self._bar_open: Decimal | None = None
         self._bar_minute: datetime | None = None
+        self._clean_bar: datetime | None = None
         self._pace = pace
         self.bars: list = []
         self.pending: _PendingEntry | None = None
@@ -210,6 +211,10 @@ class PaperRunner:
 
     async def _on_silence(self) -> None:
         self._beat()
+        if self._now().timetz().replace(tzinfo=None) >= self.account.flatten_time:
+            await self._shutdown("flatten time")
+            self.request_stop()
+            return
         if self.last_tick_at is None:
             return
         age = self._now() - self.last_tick_at
@@ -221,15 +226,36 @@ class PaperRunner:
 
     async def _on_drop(self) -> None:
         self.gap = True
+        self._clean_bar = None
         drop = getattr(self.cache, "drop", None)
         if drop is not None:
             await drop(self.token)
         self._stall_open = False
         await self.monitor.feed_stall(self.paper.stale_after.total_seconds())
         self._stall_open = True
+        if self.position is not None:
+            age = 0.0 if self.last_tick_at is None else (self._now() - self.last_tick_at).total_seconds()
+            await self.monitor.stops_blind(age)
         self._log.warning("websocket_dropped")
-        await self._sleep(self._reconnect_wait)
+        await self._sleep_until_stop(self._reconnect_wait)
         self._reconnect_wait = min(self._reconnect_wait * 2, self.paper.reconnect_max_seconds)
+
+    async def _sleep_until_stop(self, seconds: float) -> None:
+        if self._stop.is_set():
+            return
+        pause = asyncio.ensure_future(self._sleep(seconds))
+        stopped = asyncio.ensure_future(self._stop.wait())
+        try:
+            done, _pending = await asyncio.wait({pause, stopped}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            pause.cancel()
+            stopped.cancel()
+            await self._finish(pause, stopped)
+            raise
+        for task in (pause, stopped):
+            if task not in done:
+                task.cancel()
+        await self._finish(pause, stopped)
 
     async def _on_quote(self, quote: NormalizedQuote) -> None:
         self._beat()
@@ -238,21 +264,30 @@ class PaperRunner:
             self.last_price = quote.last_price
             self.request_stop()
             return
-        if self.gap:
-            self.gap = False
-            self._reconnect_wait = self.paper.reconnect_initial_seconds
-            await self.monitor.feed_resumed()
-            self._stall_open = False
         self.last_price = quote.last_price
         self.last_tick_at = moment
         self.broker.last_price = quote.last_price
         minute = floor_minute(moment)
         if minute != self._bar_minute:
+            if self.gap and self._clean_bar is None and self._bar_minute is not None:
+                self._clean_bar = minute
             self._bar_minute = minute
             self._bar_open = quote.last_price
         await self.cache.put(quote)
-        await self.monitor.stops_covered()
+        if not self.gap:
+            await self.monitor.stops_covered()
         finished = self.book.add(quote)
+        if (
+            finished is not None
+            and self.gap
+            and self._clean_bar is not None
+            and finished.bucket_start == self._clean_bar
+        ):
+            self.gap = False
+            self._clean_bar = None
+            self._reconnect_wait = self.paper.reconnect_initial_seconds
+            await self.monitor.feed_resumed()
+            self._stall_open = False
         if finished is not None:
             self.bars.append(finished)
             await self._on_bar()

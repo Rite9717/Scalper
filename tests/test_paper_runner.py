@@ -343,7 +343,7 @@ def test_websocket_drop_mid_position_blocks_entries_until_a_fresh_tick() -> None
         assert runner.broker.orders == {}
         clock["now"] = DAY + timedelta(minutes=1)
         await runner._on_quote(_quote(DAY + timedelta(minutes=1), "100", 20))
-        assert runner.gap is False
+        assert runner.gap is True
 
     asyncio.run(scenario())
 
@@ -392,6 +392,92 @@ class _AlwaysBuy:
 
     def on_bar(self, _state: MarketState) -> EntrySignal:
         return _good_signal()
+
+
+def test_silence_flattens_at_the_clock_without_a_new_tick() -> None:
+    async def scenario() -> None:
+        broker = _FillFlatten(TICK, LOT, tradingsymbol="NIFTY26OCTFUT", equity_cash=Decimal("1000000"))
+        runner, _journal, clock = _runner(broker=broker, strategy=_Script([_good_signal()]))
+        await runner.journal.start_run(
+            run_id=runner.run_id,
+            started_at=DAY,
+            strategy="trend_pullback",
+            tradingsymbol="NIFTY26OCTFUT",
+            limits=runner.limits_record,
+        )
+        for tick in _position_ticks():
+            clock["now"] = tick.received_at
+            await runner._on_quote(tick)
+        assert runner.position is not None
+        clock["now"] = datetime(2026, 10, 27, 15, 20, tzinfo=IST)
+        await runner._on_silence()
+        assert runner.engine.position_quantity == 0
+        assert any(order.intent == "flatten" for order in broker.orders.values())
+
+    asyncio.run(scenario())
+
+
+def test_a_reconnect_blocks_entries_until_a_full_clean_bar() -> None:
+    async def scenario() -> None:
+        runner, _journal, clock = _runner(strategy=_AlwaysBuy())  # type: ignore[arg-type]
+        await runner.journal.start_run(
+            run_id=runner.run_id,
+            started_at=DAY,
+            strategy="trend_pullback",
+            tradingsymbol="NIFTY26OCTFUT",
+            limits=runner.limits_record,
+        )
+        async def send(moment: datetime, volume: int) -> None:
+            clock["now"] = moment
+            await runner._on_quote(_quote(moment, "100", volume))
+
+        await send(DAY, 10)
+        await runner._on_drop()
+        await send(DAY + timedelta(seconds=30), 20)
+        assert runner.broker.orders == {}
+        await send(DAY + timedelta(minutes=1), 30)
+        assert runner.gap is True
+        assert runner.broker.orders == {}
+        await send(DAY + timedelta(minutes=2), 40)
+        assert runner.gap is False
+        assert runner.broker.orders
+
+    asyncio.run(scenario())
+
+
+def test_a_drop_with_an_open_position_alerts_that_stops_are_blind() -> None:
+    async def scenario() -> None:
+        runner, _journal, clock = _runner(strategy=_Script([_good_signal()]))
+        await runner.journal.start_run(
+            run_id=runner.run_id,
+            started_at=DAY,
+            strategy="trend_pullback",
+            tradingsymbol="NIFTY26OCTFUT",
+            limits=runner.limits_record,
+        )
+        for tick in _position_ticks():
+            clock["now"] = tick.received_at
+            await runner._on_quote(tick)
+        await runner._on_drop()
+        assert any("feed is blind" in message for message in runner.monitor.sink.messages)  # type: ignore[attr-defined]
+
+    asyncio.run(scenario())
+
+
+def test_reconnect_sleep_stops_when_shutdown_is_requested() -> None:
+    async def scenario() -> None:
+        runner, _journal, _clock = _runner(strategy=_Script([]))
+
+        async def hang(_seconds: float) -> None:
+            await asyncio.Event().wait()
+
+        runner._sleep = hang
+        task = asyncio.create_task(runner._on_drop())
+        await asyncio.sleep(0)
+        runner.request_stop()
+        await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(scenario())
 
 
 def test_loss_streak_and_expiry_day_block_a_paper_entry() -> None:
