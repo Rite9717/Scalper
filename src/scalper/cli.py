@@ -28,6 +28,7 @@ from scalper.ops.go_live import render_checklist
 from scalper.risk.killfile import KillFileError, engage, kill_path, release
 from scalper.execution.engine import UnmanagedPosition
 from scalper.paper.command import run_paper
+from scalper.paper.compare import MissingPaperRun, compare_recorded_run
 from scalper.paper.replay import NoRecordedTicks, replay_recorded_day
 from scalper.paper.startup import PaperStartupError
 from scalper.strategy.registry import STRATEGY_NAMES, build_strategy
@@ -98,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--strategy", required=True, choices=("trend_pullback", "vwap_reversion"))
     paper.add_argument("--replay", action="store_true", help="Replay recorded ticks instead of the live websocket.")
     paper.add_argument("--date", default=None, help="YYYY-MM-DD session to replay. Required with --replay.")
+
+    compare = sub.add_parser("compare", help="Compare a paper run with a backtest of the same recorded day.")
+    compare.add_argument("--run", required=True, help="Paper journal run id.")
+    compare.add_argument("--date", required=True, help="YYYY-MM-DD recorded session.")
+    compare.add_argument("--strategy", required=True, choices=("trend_pullback", "vwap_reversion"))
 
     backtest = sub.add_parser("backtest", help="Replay a candle file. The plumbing strategy claims no edge.")
     backtest.add_argument("--candles", required=True, type=Path)
@@ -293,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.replay:
                 return asyncio.run(_replay_paper(settings, args.strategy, args.date))
             return asyncio.run(run_paper(settings, args.strategy))
+        if args.command == "compare":
+            return asyncio.run(_compare(settings, args.run, args.date, args.strategy))
         if args.command == "backtest":
             return _run_backtest(settings, args)
         if args.command == "kill":
@@ -339,6 +347,27 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"unhandled command: {args.command}", file=sys.stderr)
     return 2
+
+
+async def _compare(settings: Settings, run_id: str, raw_date: str, strategy_name: str) -> int:
+    try:
+        day = datetime.strptime(raw_date, "%Y-%m-%d").date()
+    except ValueError:
+        print("date must be YYYY-MM-DD", file=sys.stderr)
+        return 2
+    try:
+        report = await compare_recorded_run(settings, run_id, day, strategy_name)
+    except MissingPaperRun as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except NoRecordedTicks as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    sys.stdout.write(report + "\n")
+    return 0
 
 
 async def _replay_paper(settings: Settings, strategy_name: str, raw_date: str | None) -> int:
