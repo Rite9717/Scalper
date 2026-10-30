@@ -38,5 +38,6 @@ def test_paper_limits_use_the_configured_settings() -> None:
     assert record["stops_blind_grace_seconds"] == "30.0"
     assert record["latency_bars"] == "2"
     assert record["slippage_ticks"] == "3"
-    assert "reconnect_initial_seconds" in record
     assert "flatten_max_adverse_ticks" in record
+    assert "reconnect_initial_seconds" not in record
+    assert "reconnect_max_seconds" not in record

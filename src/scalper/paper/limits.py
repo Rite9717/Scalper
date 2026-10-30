@@ -24,8 +24,6 @@ class PaperLimits:
     flatten_timeout: float = 30.0
     flatten_poll_interval: float = 0.5
     flatten_max_adverse_ticks: int = 20
-    reconnect_initial_seconds: float = 1.0
-    reconnect_max_seconds: float = 30.0
     stops_blind_grace: timedelta = timedelta(seconds=30)
 
 
@@ -65,8 +63,6 @@ def resolved_limits(settings: Settings, paper: PaperLimits) -> dict[str, str]:
         "flatten_timeout": str(paper.flatten_timeout),
         "flatten_poll_interval": str(paper.flatten_poll_interval),
         "flatten_max_adverse_ticks": str(paper.flatten_max_adverse_ticks),
-        "reconnect_initial_seconds": str(paper.reconnect_initial_seconds),
-        "reconnect_max_seconds": str(paper.reconnect_max_seconds),
         "stops_blind_grace_seconds": str(paper.stops_blind_grace.total_seconds()),
         "latency_bars": str(settings.latency_bars),
         "slippage_ticks": str(settings.slippage_ticks),
