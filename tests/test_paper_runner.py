@@ -800,6 +800,101 @@ async def _ping_ok() -> None:
     return None
 
 
+def test_entry_exit_and_flatten_tags_differ_at_the_same_timestamp() -> None:
+    async def scenario() -> None:
+        runner, _journal, clock = _runner(strategy=_Script([_good_signal()]))
+        tick = _quote(DAY, "100", 10)
+        clock["now"] = tick.received_at
+        await runner._on_quote(tick)
+        stamp = runner._millis(clock["now"])
+        entered = await runner.engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id=runner._strategy_id("entry"),
+            timestamp_ms=stamp,
+        )
+        exited = await runner.engine.submit_exit(
+            side="sell",
+            limit_price=Decimal("101"),
+            quantity=LOT,
+            strategy_id=runner._strategy_id("exit"),
+            timestamp_ms=stamp,
+        )
+        from scalper.kite.tags import make_order_tag
+
+        flatten = make_order_tag(timestamp_ms=stamp, strategy_id=runner._strategy_id("flatten"), sequence=0)
+        assert entered.order is not None and exited.order is not None
+        assert len({entered.order.tag, exited.order.tag, flatten}) == 3
+
+    asyncio.run(scenario())
+
+
+def test_a_partial_entry_is_tracked_as_an_open_position() -> None:
+    async def scenario() -> None:
+        broker = PaperBroker(TICK, LOT, tradingsymbol="NIFTY26OCTFUT", equity_cash=Decimal("1000000"))
+        original = broker.on_trade
+
+        def half(price: Decimal, quantity: int, fill_price: Decimal | None = None):
+            return original(price, 5, fill_price)
+
+        broker.on_trade = half  # type: ignore[method-assign]
+        runner, _journal, clock = _runner(broker=broker, strategy=_Script([_good_signal()]))
+        await runner.journal.start_run(
+            run_id=runner.run_id,
+            started_at=DAY,
+            strategy="trend_pullback",
+            tradingsymbol="NIFTY26OCTFUT",
+            limits=runner.limits_record,
+        )
+        for tick in _position_ticks():
+            clock["now"] = tick.received_at
+            await runner._on_quote(tick)
+        assert runner.position is not None
+        assert runner.position.quantity == 5
+        clock["now"] = DAY + timedelta(minutes=3)
+        await runner._on_quote(_quote(clock["now"], "99", 60))
+        exits = [order for order in broker.orders.values() if order.intent == "exit"]
+        assert exits
+        assert exits[-1].quantity == 5
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_journals_the_flatten_fill_and_clears_the_pending_entry() -> None:
+    async def scenario() -> None:
+        class PricedFlatten(PaperBroker):
+            async def get_orders(self):
+                for tag, order in list(self.orders.items()):
+                    if order.intent == "flatten" and order.working:
+                        self.orders[tag] = fill(order, order.quantity, order.limit_price - TICK)
+                return list(self.orders.values())
+
+        broker = PricedFlatten(TICK, LOT, tradingsymbol="NIFTY26OCTFUT", equity_cash=Decimal("1000000"))
+        runner, journal, clock = _runner(broker=broker, strategy=_Script([_good_signal()]))
+        await journal.start_run(
+            run_id=runner.run_id,
+            started_at=DAY,
+            strategy="trend_pullback",
+            tradingsymbol="NIFTY26OCTFUT",
+            limits=runner.limits_record,
+        )
+        for tick in _position_ticks():
+            clock["now"] = tick.received_at
+            await runner._on_quote(tick)
+        runner.pending = object()  # type: ignore[assignment]
+        await runner._shutdown("stop")
+        view = await journal.read(runner.run_id)
+        assert runner.last_price == Decimal("100")
+        assert view["exits"][-1]["fill_price"] == format(Decimal("100") - TICK, "f")
+        assert view["exits"][-1]["fill_price"] != format(runner.last_price, "f")
+        assert view["exits"][-1]["quantity"] == LOT
+        assert runner.pending is None
+
+    asyncio.run(scenario())
+
+
 class _Once:
     name = "once"
 

@@ -335,7 +335,7 @@ class PaperRunner:
             limit_price=signal.limit_price,
             quantity=self.quantity,
             stop_price=signal.stop_price,
-            strategy_id=self.strategy.name,
+            strategy_id=self._strategy_id("entry"),
             timestamp_ms=stamp,
         )
         await self._record_decision(Intent.ENTRY, result.decision.allowed, result.decision.action, result.decision.reason)
@@ -402,8 +402,8 @@ class PaperRunner:
             price=order.average_price,
             quantity=order.filled_quantity,
         )
-        if order.status is not OrderStatus.FILLED:
-            return
+        # Paper fills are always complete. A partial fill is still an open position
+        # and must be tracked here; revisit this path before any live runner.
         self.position = OpenPosition(
             side=order.side,
             quantity=order.filled_quantity,
@@ -414,7 +414,8 @@ class PaperRunner:
             time_stop_bars=self.pending.signal.time_stop_bars,
             tag=order.tag,
         )
-        self.pending = None
+        if order.status is OrderStatus.FILLED:
+            self.pending = None
 
     async def _cancel_entry(self) -> None:
         assert self.pending is not None and self.pending.order.broker_order_id is not None
@@ -430,7 +431,7 @@ class PaperRunner:
             side=side,
             limit_price=trigger.price,
             quantity=self.position.quantity,
-            strategy_id=self.strategy.name,
+            strategy_id=self._strategy_id("exit"),
             timestamp_ms=stamp,
         )
         await self._record_decision(Intent.EXIT, result.decision.allowed, result.decision.action, result.decision.reason)
@@ -510,7 +511,7 @@ class PaperRunner:
         result = await self.engine.modify_price(
             self.exit.order.tag,
             nxt,
-            strategy_id=self.strategy.name,
+            strategy_id=self._strategy_id("exit"),
             timestamp_ms=self.exit.timestamp_ms,
         )
         if result.order is not None:
@@ -619,26 +620,50 @@ class PaperRunner:
 
     async def _shutdown(self, reason: str) -> None:
         try:
-            await self.engine.shutdown(self.last_price)
+            await self.engine.shutdown(self.last_price, strategy_id=self._strategy_id("flatten"))
         except UnmanagedPosition as exc:
             engage(self.kill_file, f"{reason}: {exc}")
             await self.monitor.kill_switch(True, f"{reason}: {exc}")
             raise
-        if self.engine.position_quantity == 0 and self.position is not None:
+        filled = [
+            order
+            for order in self.engine.orders.values()
+            if order.intent == "flatten" and order.status is OrderStatus.FILLED and order.filled_quantity > 0
+        ]
+        if filled:
+            order = filled[-1]
             await self.journal.record_exit(
                 run_id=self.run_id,
                 at=self._now(),
                 reason="flatten",
                 trigger_at=self._now(),
-                trigger_price=self.last_price,
+                trigger_price=order.limit_price,
                 fill_at=self._now(),
-                fill_price=self.last_price,
-                quantity=self.position.quantity,
+                fill_price=order.average_price,
+                quantity=order.filled_quantity,
             )
-            self.position = None
-            self.exit = None
+        self.pending = None
+        self.position = None
+        self.exit = None
+
+    def _strategy_id(self, role: str) -> str:
+        return f"{self.strategy.name}-{role}"
 
     async def _abandon(self, reason: str) -> None:
+        order = self.exit.order if self.exit is not None else None
+        trigger = self.exit.trigger_price if self.exit is not None else None
+        remaining = order.remaining if order is not None else self.engine.position_quantity
+        order_id = order.broker_order_id if order is not None else None
+        await self.journal.record_exit(
+            run_id=self.run_id,
+            at=self._now(),
+            reason=f"{reason}; order_id={order_id}; remaining={remaining}",
+            trigger_at=self.exit.trigger_at if self.exit is not None else None,
+            trigger_price=trigger,
+            fill_at=None,
+            fill_price=self.last_price,
+            quantity=remaining,
+        )
         engage(self.kill_file, reason)
         await self.monitor.kill_switch(True, reason)
         raise UnmanagedPosition(reason)

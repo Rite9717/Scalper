@@ -241,7 +241,7 @@ class ExecutionEngine:
         self.position_quantity = _net_filled(list(self.orders.values()))
         await self._check_broker_position()
 
-    async def shutdown(self, last_price: Decimal | None) -> ShutdownReport:
+    async def shutdown(self, last_price: Decimal | None, strategy_id: str = "flatten") -> ShutdownReport:
         book = await self.refresh()
         self._raise_for_foreign()
         for order in list(self.orders.values()):
@@ -260,7 +260,7 @@ class ExecutionEngine:
             side=side,
             limit_price=last_price,
             quantity=abs(self.position_quantity),
-            strategy_id="flatten",
+            strategy_id=strategy_id,
             timestamp_ms=stamp,
             planned_loss=Decimal("0"),
         )
@@ -278,10 +278,17 @@ class ExecutionEngine:
             self.flatten_max_adverse_ticks,
             self.tick_size,
         )
-        await self._drive_flatten(result.order.broker_order_id, worst, self._monotonic(), stamp)
+        await self._drive_flatten(result.order.broker_order_id, worst, self._monotonic(), stamp, strategy_id)
         return ShutdownReport(True, self.position_quantity)
 
-    async def _drive_flatten(self, order_id: str, worst: Decimal, placed_at: float, timestamp_ms: int) -> None:
+    async def _drive_flatten(
+        self,
+        order_id: str,
+        worst: Decimal,
+        placed_at: float,
+        timestamp_ms: int,
+        strategy_id: str,
+    ) -> None:
         deadline = placed_at + self.flatten_timeout
         # The first reprice waits one full poll after the order is placed.
         last_modify_at = placed_at
@@ -304,13 +311,13 @@ class ExecutionEngine:
                     if self.position_quantity == 0:
                         return
                     raise UnmanagedPosition(f"remaining {self.position_quantity}; orders {order_id}")
-                sequence = self._replacement_sequence(timestamp_ms, "flatten")
+                sequence = self._replacement_sequence(timestamp_ms, strategy_id)
                 replaced = await self._submit(
                     intent=Intent.FLATTEN,
                     side=order.side,
                     limit_price=nxt,
                     quantity=booked.remaining,
-                    strategy_id="flatten",
+                    strategy_id=strategy_id,
                     timestamp_ms=timestamp_ms,
                     planned_loss=Decimal("0"),
                     sequence=sequence,
