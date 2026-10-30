@@ -867,6 +867,119 @@ def test_live_feed_stall_kill_drift_pnl_rejects_and_margin_block_entries() -> No
     asyncio.run(scenario())
 
 
+def test_gross_pnl_matches_the_broker_after_charges_and_a_real_price_discrepancy_does_not() -> None:
+    async def scenario() -> None:
+        broker = FakeBroker()
+
+        async def healthy_margins():
+            return _healthy_margins()
+
+        broker.get_margins = healthy_margins  # type: ignore[method-assign]
+        cache = MemoryQuoteCache()
+        cache.values[1] = _cached_quote(NOW, NOW)
+        provider = LiveSnapshotProvider(
+            broker=broker,
+            cache=cache,
+            instrument_token=1,
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            kill_file=Path("pnl-kill"),
+            live=True,
+            now=lambda: NOW,
+            limits=AccountLimits(trading_mode="live"),
+            tick_size=TICK,
+        )
+        engine = ExecutionEngine(
+            broker,
+            provider,
+            tradingsymbol=SYMBOL,
+            exchange=EXCHANGE,
+            lot_size=LOT,
+            tick_size=TICK,
+            kill_file=Path("engine-kill"),
+            monitor=Monitor(build_metrics(CollectorRegistry()), RecordingSink()),
+            flatten_timeout=5.0,
+            flatten_poll_interval=0.25,
+            flatten_max_adverse_ticks=4,
+        )
+        bought = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=60_000,
+        )
+        assert bought.order is not None and bought.order.broker_order_id is not None
+        broker.show(bought.order.broker_order_id, status=OrderStatus.FILLED, filled_quantity=LOT, average_price=Decimal("100"))
+        await engine.refresh()
+        sold = await engine.submit_exit(
+            side="sell",
+            limit_price=Decimal("110"),
+            quantity=LOT,
+            strategy_id="trend",
+            timestamp_ms=61_000,
+        )
+        assert sold.order is not None and sold.order.broker_order_id is not None
+        broker.show(sold.order.broker_order_id, status=OrderStatus.FILLED, filled_quantity=LOT, average_price=Decimal("110"))
+        await engine.refresh()
+        gross = (Decimal("110") - Decimal("100")) * LOT
+
+        async def flat_book():
+            return PositionBook(
+                (BrokerPosition(SYMBOL, EXCHANGE, "MIS", 0, Decimal("0"), 0, gross, Decimal("110")),),
+                (),
+            )
+
+        broker.get_positions = flat_book  # type: ignore[method-assign]
+        seen: list[RiskSnapshot] = []
+        original = provider.build
+
+        async def capture(**kwargs: object):
+            snap = await original(**kwargs)  # type: ignore[arg-type]
+            seen.append(snap)
+            return snap
+
+        provider.build = capture  # type: ignore[method-assign]
+        probe = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=62_000,
+        )
+        assert probe.decision.allowed is True
+        assert probe.decision.reason != "pnl mismatch versus broker"
+        assert seen[-1].internal_pnl == gross
+        assert seen[-1].broker_pnl == gross
+        assert seen[-1].daily_pnl < gross
+
+        broker.show(sold.order.broker_order_id, status=OrderStatus.CANCELLED, filled_quantity=0, average_price=Decimal("0"))
+
+        async def different_average():
+            return PositionBook(
+                (BrokerPosition(SYMBOL, EXCHANGE, "MIS", LOT, Decimal("120"), 0, None, Decimal("200")),),
+                (),
+            )
+
+        broker.get_positions = different_average  # type: ignore[method-assign]
+        cache.values[1] = _cached_quote(NOW, NOW)
+        cache.values[1]["last_price"] = "100"
+        mismatch = await engine.submit_entry(
+            side="buy",
+            limit_price=Decimal("100"),
+            quantity=LOT,
+            stop_price=Decimal("99"),
+            strategy_id="trend",
+            timestamp_ms=63_000,
+        )
+        assert mismatch.order is None
+        assert mismatch.decision.reason == "pnl mismatch versus broker"
+
+    asyncio.run(scenario())
+
+
 def test_live_mode_does_not_skip_a_missing_broker_pnl_or_exchange_time() -> None:
     async def scenario() -> None:
         broker = FakeBroker()

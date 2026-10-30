@@ -30,6 +30,7 @@ class BrokerPosition:
     average_price: Decimal
     overnight_quantity: int
     pnl: Decimal | None = None
+    last_price: Decimal | None = None
 
 
 @dataclass(frozen=True)

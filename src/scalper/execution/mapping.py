@@ -128,6 +128,7 @@ def _position_list(rows: Any, book: str) -> tuple[BrokerPosition, ...]:
                 average_price=_decimal(row, "average_price"),
                 overnight_quantity=_int(row, "overnight_quantity"),
                 pnl=_optional_decimal(row, "pnl"),
+                last_price=_optional_decimal(row, "last_price"),
             )
         )
     return tuple(mapped)

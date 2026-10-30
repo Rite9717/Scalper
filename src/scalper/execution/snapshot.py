@@ -145,10 +145,11 @@ class LiveSnapshotProvider:
         now = self._now()
         limits = self.limits
         killed = self._kill_flag()
-        last_quote_at, exchange_time, last_price, quote_missing = await self._quote()
-        broker_pnl, pnl_missing = await self._broker_pnl()
+        last_quote_at, exchange_time, cached_last, quote_missing = await self._quote()
+        broker_pnl, pnl_missing, mark = await self._broker_gross(cached_last)
         available, required, margin_missing = await self._margins()
-        internal = _pnl_from_fills(orders, last_price, self.schedule)
+        gross = _gross_from_fills(orders, mark)
+        daily = gross - _charges(orders, self.schedule)
         if self.live and (pnl_missing or exchange_time is None or quote_missing):
             last_quote_at = None
             available = None
@@ -167,7 +168,7 @@ class LiveSnapshotProvider:
             max_lots=limits.max_lots,
             planned_loss=planned_loss,
             max_loss_per_trade=limits.max_loss_per_trade,
-            daily_pnl=internal,
+            daily_pnl=daily,
             daily_loss_limit=limits.daily_loss_limit,
             orders_last_second=self._since(self._orders, now, timedelta(seconds=1)),
             orders_last_minute=self._since(self._orders, now, timedelta(minutes=1)),
@@ -179,7 +180,7 @@ class LiveSnapshotProvider:
             required_margin=required,
             flatten_time=limits.flatten_time,
             broker_pnl=broker_pnl,
-            internal_pnl=internal,
+            internal_pnl=gross,
             pnl_tolerance=limits.pnl_tolerance,
             exchange_time=exchange_time,
             clock_drift_limit=limits.clock_drift_limit,
@@ -208,23 +209,35 @@ class LiveSnapshotProvider:
             return None, exchange_time, last_price, True
         return received, exchange_time, last_price, False
 
-    async def _broker_pnl(self) -> tuple[Decimal | None, bool]:
+    async def _broker_gross(self, cached_last: Decimal | None) -> tuple[Decimal | None, bool, Decimal | None]:
+        """Gross price PnL of the broker's position, marked at the same last price as our fills."""
         try:
             book = await self.broker.get_positions()
         except Exception:
-            return None, True
+            return None, True, cached_last
+        matching = [
+            position
+            for position in book.net
+            if position.tradingsymbol == self.tradingsymbol and position.exchange == self.exchange
+        ]
+        mark = cached_last
+        for position in matching:
+            if position.last_price is not None:
+                mark = position.last_price
+                break
+        if not matching:
+            return Decimal("0"), False, mark
         total = Decimal("0")
-        saw = False
-        for position in book.net:
-            if position.tradingsymbol != self.tradingsymbol or position.exchange != self.exchange:
+        for position in matching:
+            if position.quantity == 0:
+                if position.pnl is None:
+                    return None, True, mark
+                total += position.pnl
                 continue
-            saw = True
-            if position.pnl is None:
-                return None, True
-            total += position.pnl
-        if not saw:
-            return Decimal("0"), False
-        return total, False
+            if mark is None:
+                return None, True, mark
+            total += (mark - position.average_price) * position.quantity
+        return total, False, mark
 
     async def _margins(self) -> tuple[Decimal | None, Decimal | None, bool]:
         try:
@@ -274,26 +287,32 @@ def _parse_decimal(value: object) -> Decimal | None:
     return None
 
 
-def _pnl_from_fills(
-    orders: Sequence[ManagedOrder],
-    last_price: Decimal | None,
-    schedule: ChargeSchedule,
-) -> Decimal:
+def _gross_from_fills(orders: Sequence[ManagedOrder], mark: Decimal | None) -> Decimal:
+    """Price PnL only. Charges are not included, so this can match the broker's gross PnL."""
     cash = Decimal("0")
     net = 0
     for order in orders:
         if order.filled_quantity < 1:
             continue
         turnover = order.average_price * order.filled_quantity
-        brokerage, exchange, sebi, stt, stamp = side_charges(schedule, turnover=turnover, side=order.side)
-        gst = (schedule.gst_rate * (brokerage + exchange + sebi)).quantize(PAISE)
-        charges = brokerage + exchange + sebi + stt + stamp + gst
         if order.side == "buy":
-            cash -= turnover + charges
+            cash -= turnover
             net += order.filled_quantity
         else:
-            cash += turnover - charges
+            cash += turnover
             net -= order.filled_quantity
-    if net != 0 and last_price is not None:
-        cash += last_price * net
+    if net != 0 and mark is not None:
+        cash += mark * net
     return cash
+
+
+def _charges(orders: Sequence[ManagedOrder], schedule: ChargeSchedule) -> Decimal:
+    total = Decimal("0")
+    for order in orders:
+        if order.filled_quantity < 1:
+            continue
+        turnover = order.average_price * order.filled_quantity
+        brokerage, exchange, sebi, stt, stamp = side_charges(schedule, turnover=turnover, side=order.side)
+        gst = (schedule.gst_rate * (brokerage + exchange + sebi)).quantize(PAISE)
+        total += brokerage + exchange + sebi + stt + stamp + gst
+    return total
